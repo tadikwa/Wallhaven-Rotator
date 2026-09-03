@@ -1,4 +1,4 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
 
 $Root = Split-Path -Parent $PSScriptRoot
 $Source = Join-Path $Root "src\Wallhaven-Wallpaper-Tray.ps1"
@@ -16,6 +16,7 @@ if ($parseErrors.Count -gt 0) {
 }
 
 foreach ($name in @(
+    "Get-PrimaryResolution",
     "Get-WallhavenRatioForSize",
     "Convert-WallhavenRatioChoice",
     "Get-TargetDisplayFilter",
