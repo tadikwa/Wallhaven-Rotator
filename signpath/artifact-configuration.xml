@@ -1,0 +1,12 @@
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <pe-file path="WallhavenRotator-Setup-v1.0.0.exe"
+           product-name="Wallhaven Rotator"
+           product-version="1.0.0"
+           file-version="1.0.0.0"
+           company-name="Wallhaven Rotator Project"
+           original-filename="WallhavenRotator-Setup-v1.0.0.exe">
+    <authenticode-sign
+      description="Wallhaven Rotator Setup"
+      description-url="https://github.com/tadikwa/Wallhaven-Rotator" />
+  </pe-file>
+</artifact-configuration>
