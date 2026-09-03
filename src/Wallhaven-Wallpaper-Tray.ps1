@@ -6,7 +6,7 @@
 # Version épurée : rotation du wallpaper Wallhaven uniquement.
 
 $ErrorActionPreference = "Stop"
-$script:AppVersion = "1.0.1"
+$script:AppVersion = "1.1.0"
 
 Add-Type -AssemblyName PresentationFramework
 Add-Type -AssemblyName PresentationCore
@@ -30,12 +30,19 @@ $LogDir = Join-Path $BaseDir "logs"
 $SettingsPath = Join-Path $BaseDir "settings.json"
 $HistoryPath = Join-Path $BaseDir "history.json"
 $ShowRequestPath = Join-Path $BaseDir "show.request"
+$UpdateDir = Join-Path $BaseDir "updates"
 
 $IconPath = Join-Path $PSScriptRoot "Wallhaven-Rotator.ico"
 $LauncherPath = Join-Path $PSScriptRoot "Wallhaven-Rotator-Launcher.vbs"
 $WScriptPath = Join-Path $env:WINDIR "System32\wscript.exe"
 
 $ApiBase = "https://wallhaven.cc/api/v1/search"
+$GitHubLatestReleaseApi = "https://api.github.com/repos/tadikwa/Wallhaven-Rotator/releases/latest"
+$GitHubReleasesUrl = "https://github.com/tadikwa/Wallhaven-Rotator/releases"
+$UpdateCheckInterval = [TimeSpan]::FromHours(6)
+$ExpectedUpdateSignerCn = "CN=SignPath Foundation"
+$ExpectedUpdateSignerOrg = "O=SignPath Foundation"
+$UpdateRetentionDays = 7
 $LogRetentionDays = 7
 $LogMaxBytes = 2097152
 
@@ -50,6 +57,7 @@ $ApiSelectionAttemptsPerMode = 4
 New-Item -ItemType Directory -Path $BaseDir -Force | Out-Null
 New-Item -ItemType Directory -Path $CacheDir -Force | Out-Null
 New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
+New-Item -ItemType Directory -Path $UpdateDir -Force | Out-Null
 
 $script:LastLogCleanup = [DateTime]::MinValue
 
@@ -180,6 +188,14 @@ try {
 $SortNames = @("Tendance", "Populaires", "Nouveaux", "Aléatoire")
 $CategoryNames = @("Général", "Anime", "Personnes", "Toutes")
 $UnitNames = @("Minutes", "Heures", "Jours")
+$ResolutionModeNames = @("Automatique", "Personnalisé")
+$ResolutionMatchNames = @("Au moins", "Exacte")
+$CustomRatioNames = @(
+    "Automatique",
+    "16:9", "16:10", "21:9", "32:9", "48:9",
+    "4:3", "5:4", "3:2", "1:1",
+    "10:16", "9:16", "9:18"
+)
 
 function Get-DefaultSettings {
     [pscustomobject]@{
@@ -188,6 +204,14 @@ function Get-DefaultSettings {
         value = 1
         unit = "Minutes"
         autoRotation = $true
+        resolutionMode = "Automatique"
+        resolutionMatch = "Au moins"
+        customWidth = 2560
+        customHeight = 1440
+        customRatio = "Automatique"
+        checkUpdates = $true
+        autoUpdate = $false
+        lastNotifiedUpdate = ""
     }
 }
 
@@ -233,12 +257,52 @@ function Load-Settings {
             [bool]$old.autoRotation
         }
 
+        $resolutionMode = if ([string]$old.resolutionMode -in $ResolutionModeNames) {
+            [string]$old.resolutionMode
+        } else {
+            $defaults.resolutionMode
+        }
+
+        $customWidth = 0
+        if (-not [int]::TryParse([string]$old.customWidth, [ref]$customWidth) -or $customWidth -lt 640 -or $customWidth -gt 15360) {
+            $customWidth = $defaults.customWidth
+        }
+
+        $customHeight = 0
+        if (-not [int]::TryParse([string]$old.customHeight, [ref]$customHeight) -or $customHeight -lt 480 -or $customHeight -gt 8640) {
+            $customHeight = $defaults.customHeight
+        }
+
+        $resolutionMatch = if ([string]$old.resolutionMatch -in $ResolutionMatchNames) {
+            [string]$old.resolutionMatch
+        } else {
+            $defaults.resolutionMatch
+        }
+
+        $customRatio = if ([string]$old.customRatio -in $CustomRatioNames) {
+            [string]$old.customRatio
+        } else {
+            $defaults.customRatio
+        }
+
+        $checkUpdates = if ($null -eq $old.checkUpdates) { $true } else { [bool]$old.checkUpdates }
+        $autoUpdate = if ($null -eq $old.autoUpdate) { $false } else { [bool]$old.autoUpdate }
+        $lastNotifiedUpdate = if ($null -eq $old.lastNotifiedUpdate) { "" } else { [string]$old.lastNotifiedUpdate }
+
         return [pscustomobject]@{
             sort = $sort
             category = $category
             value = $value
             unit = $unit
             autoRotation = $auto
+            resolutionMode = $resolutionMode
+            resolutionMatch = $resolutionMatch
+            customWidth = $customWidth
+            customHeight = $customHeight
+            customRatio = $customRatio
+            checkUpdates = $checkUpdates
+            autoUpdate = $autoUpdate
+            lastNotifiedUpdate = $lastNotifiedUpdate
         }
     }
     catch {
@@ -255,6 +319,14 @@ function Save-Settings {
             value = [int]$script:Settings.value
             unit = [string]$script:Settings.unit
             autoRotation = [bool]$script:Settings.autoRotation
+            resolutionMode = [string]$script:Settings.resolutionMode
+            resolutionMatch = [string]$script:Settings.resolutionMatch
+            customWidth = [int]$script:Settings.customWidth
+            customHeight = [int]$script:Settings.customHeight
+            customRatio = [string]$script:Settings.customRatio
+            checkUpdates = [bool]$script:Settings.checkUpdates
+            autoUpdate = [bool]$script:Settings.autoUpdate
+            lastNotifiedUpdate = [string]$script:Settings.lastNotifiedUpdate
         } |
             ConvertTo-Json |
             Set-Content -Path $SettingsPath -Encoding UTF8
@@ -317,6 +389,148 @@ function Get-PrimaryResolution {
     catch {
         [pscustomobject]@{ Width = 0; Height = 0 }
     }
+}
+
+function Get-WallhavenRatioForSize {
+    param(
+        [int]$Width,
+        [int]$Height
+    )
+
+    if ($Width -le 0 -or $Height -le 0) {
+        return "16x9"
+    }
+
+    $target = [double]$Width / [double]$Height
+    $ratios = @(
+        [pscustomobject]@{ Name = "48x9"; Value = 48.0 / 9.0 },
+        [pscustomobject]@{ Name = "32x9"; Value = 32.0 / 9.0 },
+        [pscustomobject]@{ Name = "21x9"; Value = 21.0 / 9.0 },
+        [pscustomobject]@{ Name = "16x9"; Value = 16.0 / 9.0 },
+        [pscustomobject]@{ Name = "16x10"; Value = 16.0 / 10.0 },
+        [pscustomobject]@{ Name = "3x2"; Value = 3.0 / 2.0 },
+        [pscustomobject]@{ Name = "4x3"; Value = 4.0 / 3.0 },
+        [pscustomobject]@{ Name = "5x4"; Value = 5.0 / 4.0 },
+        [pscustomobject]@{ Name = "1x1"; Value = 1.0 },
+        [pscustomobject]@{ Name = "10x16"; Value = 10.0 / 16.0 },
+        [pscustomobject]@{ Name = "9x16"; Value = 9.0 / 16.0 },
+        [pscustomobject]@{ Name = "9x18"; Value = 9.0 / 18.0 }
+    )
+
+    $best = $ratios[0]
+    $bestDistance = [double]::MaxValue
+
+    foreach ($ratio in $ratios) {
+        # Log distance treats reciprocal/relative differences consistently.
+        $distance = [math]::Abs([math]::Log($target / [double]$ratio.Value))
+        if ($distance -lt $bestDistance) {
+            $bestDistance = $distance
+            $best = $ratio
+        }
+    }
+
+    return [string]$best.Name
+}
+
+function Convert-WallhavenRatioChoice {
+    param(
+        [string]$Choice,
+        [int]$Width,
+        [int]$Height
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Choice) -or $Choice -eq "Automatique") {
+        return (Get-WallhavenRatioForSize -Width $Width -Height $Height)
+    }
+
+    if ($Choice -in $CustomRatioNames) {
+        return $Choice.Replace(":", "x")
+    }
+
+    return (Get-WallhavenRatioForSize -Width $Width -Height $Height)
+}
+
+function Get-TargetDisplayFilter {
+    if ([string]$script:Settings.resolutionMode -eq "Personnalisé") {
+        $width = [int]$script:Settings.customWidth
+        $height = [int]$script:Settings.customHeight
+        $source = "Personnalisé"
+        $matchMode = if ([string]$script:Settings.resolutionMatch -in $ResolutionMatchNames) {
+            [string]$script:Settings.resolutionMatch
+        } else {
+            "Au moins"
+        }
+        $ratioChoice = [string]$script:Settings.customRatio
+    }
+    else {
+        $screen = Get-PrimaryResolution
+        $width = [int]$screen.Width
+        $height = [int]$screen.Height
+        $source = "Automatique"
+        $matchMode = "Au moins"
+        $ratioChoice = "Automatique"
+    }
+
+    if ($width -le 0 -or $height -le 0) {
+        $width = 1920
+        $height = 1080
+        $source = "Secours"
+        $matchMode = "Au moins"
+        $ratioChoice = "Automatique"
+    }
+
+    $ratio = Convert-WallhavenRatioChoice `
+        -Choice $ratioChoice `
+        -Width $width `
+        -Height $height
+
+    [pscustomobject]@{
+        Width = $width
+        Height = $height
+        Ratio = $ratio
+        Source = $source
+        MatchMode = $matchMode
+        RatioChoice = $ratioChoice
+        IsExact = ($matchMode -eq "Exacte")
+        Label = "$width×$height · $($ratio.Replace('x', ':'))"
+    }
+}
+
+function Get-ResolutionQueryParameters {
+    param(
+        $Target,
+        [bool]$UseResolution
+    )
+
+    $result = [ordered]@{}
+
+    if ($Target -and -not [string]::IsNullOrWhiteSpace([string]$Target.Ratio)) {
+        $result["ratios"] = [string]$Target.Ratio
+    }
+
+    if ($Target -and [int]$Target.Width -gt 0 -and [int]$Target.Height -gt 0) {
+        if ([bool]$Target.IsExact) {
+            $result["resolutions"] = "$([int]$Target.Width)x$([int]$Target.Height)"
+        }
+        elseif ($UseResolution) {
+            $result["atleast"] = "$([int]$Target.Width)x$([int]$Target.Height)"
+        }
+    }
+
+    return $result
+}
+
+function Test-ResolutionFallbackAllowed {
+    param(
+        $Target,
+        [bool]$UseResolution
+    )
+
+    return (
+        $UseResolution -and
+        $Target -and
+        -not [bool]$Target.IsExact
+    )
 }
 
 function Load-WallpaperHistory {
@@ -429,10 +643,28 @@ function Get-SelectionPageLimit {
 }
 
 function Get-SelectionPage {
-    $limit = Get-SelectionPageLimit
+    $configuredLimit = Get-SelectionPageLimit
+
+    if ($configuredLimit -le 1) {
+        $script:ApiCurrentPage = 1
+        return 1
+    }
+
+    # On the first request for a filter combination, ask page 1 so Wallhaven
+    # can tell us meta.last_page. Subsequent requests randomize only inside
+    # the actual page range, avoiding pointless empty-page retries.
+    $limit = 1
+    if (
+        $script:ApiQueryKey -and
+        $script:PageCeilings.ContainsKey($script:ApiQueryKey)
+    ) {
+        $lastPage = [int]$script:PageCeilings[$script:ApiQueryKey]
+        $limit = [math]::Max(1, [math]::Min($configuredLimit, $lastPage))
+    }
 
     if ($limit -le 1) {
         $script:ApiCurrentPage = 1
+        if ($script:PagesTried -notcontains 1) { $script:PagesTried += 1 }
         return 1
     }
 
@@ -483,19 +715,30 @@ function Get-ApiUrl {
         }
     }
 
+    $target = Get-TargetDisplayFilter
+    $resolutionParams = Get-ResolutionQueryParameters `
+        -Target $target `
+        -UseResolution $UseResolution
+
+    foreach ($key in $resolutionParams.Keys) {
+        $params[$key] = [string]$resolutionParams[$key]
+    }
+
+    $script:ApiQueryKey = "{0}|{1}|{2}|{3}|{4}|{5}x{6}" -f `
+        [string]$script:Settings.sort,
+        [string]$script:Settings.category,
+        [string]$target.Ratio,
+        [string]$target.MatchMode,
+        [bool]$UseResolution,
+        [int]$target.Width,
+        [int]$target.Height
+
     $pageLimit = Get-SelectionPageLimit
     if ($pageLimit -gt 1) {
         $params["page"] = [string](Get-SelectionPage)
     }
     else {
         $script:ApiCurrentPage = 1
-    }
-
-    if ($UseResolution) {
-        $screen = Get-PrimaryResolution
-        if ($screen.Width -gt 0 -and $screen.Height -gt 0) {
-            $params["atleast"] = "$($screen.Width)x$($screen.Height)"
-        }
     }
 
     "$ApiBase`?$(ConvertTo-QueryString -Parameters $params)"
@@ -671,6 +914,412 @@ function Get-DeepErrorMessage {
     return [string]$ErrorRecord
 }
 
+
+function Test-IsNewerVersion {
+    param(
+        [string]$Candidate,
+        [string]$Current = $script:AppVersion
+    )
+
+    try {
+        return ([version]$Candidate -gt [version]$Current)
+    }
+    catch {
+        return $false
+    }
+}
+
+function Get-SignedSetupAssetName {
+    param([string]$Version)
+    return "WallhavenRotator-Setup-v$Version.exe"
+}
+
+function Test-ExpectedUpdatePublisher {
+    param([string]$Subject)
+
+    if ([string]::IsNullOrWhiteSpace($Subject)) {
+        return $false
+    }
+
+    $cn = [regex]::Escape($ExpectedUpdateSignerCn)
+    $org = [regex]::Escape($ExpectedUpdateSignerOrg)
+
+    return (
+        $Subject -match "(^|,\s*)$cn(,|$)" -and
+        $Subject -match "(^|,\s*)$org(,|$)"
+    )
+}
+
+function Get-ExpectedHashFromChecksumText {
+    param(
+        [string]$Text,
+        [string]$FileName
+    )
+
+    if (
+        [string]::IsNullOrWhiteSpace($Text) -or
+        [string]::IsNullOrWhiteSpace($FileName)
+    ) {
+        return $null
+    }
+
+    $escapedName = [regex]::Escape($FileName)
+    $match = [regex]::Match(
+        $Text,
+        "(?im)^([0-9a-f]{64})\s+[* ]?$escapedName\s*$"
+    )
+
+    if (-not $match.Success) {
+        return $null
+    }
+
+    return $match.Groups[1].Value.ToLowerInvariant()
+}
+
+function Show-UpdateNotification {
+    param([string]$Version)
+
+    if (
+        $script:UpdateNotifiedVersion -eq $Version -or
+        [string]$script:Settings.lastNotifiedUpdate -eq $Version
+    ) {
+        return
+    }
+
+    $script:UpdateNotifiedVersion = $Version
+    $script:Settings.lastNotifiedUpdate = $Version
+    Save-Settings
+
+    try {
+        $notifyIcon.BalloonTipTitle = "Wallhaven Rotator $Version disponible"
+        $notifyIcon.BalloonTipText = "Une nouvelle version est disponible. Ouvrez Wallhaven Rotator pour la mettre à jour."
+        $notifyIcon.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Info
+        $notifyIcon.ShowBalloonTip(6000)
+    } catch {}
+}
+
+function Update-UpdateUi {
+    if ($null -ne $script:UpdateInfo -and (Test-IsNewerVersion -Candidate $script:UpdateInfo.Version)) {
+        $VersionText.Text = "v$($script:AppVersion) · MAJ $($script:UpdateInfo.Version)"
+        $VersionText.Foreground = [Windows.Media.SolidColorBrush]::new([Windows.Media.Color]::FromRgb(169, 233, 195))
+        $UpdateBanner.Visibility = [System.Windows.Visibility]::Visible
+        $UpdateBannerTitle.Text = "Mise à jour $($script:UpdateInfo.Version) disponible"
+
+        if ($script:UpdateInfo.SignedAssetAvailable) {
+            if (-not $script:UpdateInfo.HashAvailable) {
+                $UpdateBannerText.Text = "Setup signé disponible, mais somme SHA-256 absente : installation automatique désactivée."
+                $UpdateActionButton.Content = "Voir la release"
+            }
+            elseif ($script:UpdateReadyPath) {
+                $UpdateBannerText.Text = "Setup SignPath vérifié et prêt à installer."
+                $UpdateActionButton.Content = "Installer"
+            }
+            elseif ($script:UpdateStage -in @("Hash", "Binary")) {
+                $UpdateBannerText.Text = "Téléchargement et vérification en cours…"
+                $UpdateActionButton.Content = "Patientez…"
+            }
+            else {
+                $UpdateBannerText.Text = "Setup signé publié ; cliquez pour le télécharger puis vérifier SHA-256 et Authenticode."
+                $UpdateActionButton.Content = "Mettre à jour"
+            }
+        }
+        else {
+            $UpdateBannerText.Text = "La release existe, mais aucun setup signé n'est encore disponible."
+            $UpdateActionButton.Content = "Voir la release"
+        }
+    }
+    else {
+        $VersionText.Text = "v$($script:AppVersion)"
+        $VersionText.Foreground = [Windows.Media.SolidColorBrush]::new([Windows.Media.Color]::FromRgb(168, 177, 181))
+        $UpdateBanner.Visibility = [System.Windows.Visibility]::Collapsed
+    }
+
+    if ($UpdateStateText) {
+        if ($script:UpdateStage -in @("Check", "Hash", "Binary")) {
+            $UpdateStateText.Text = "Vérification en cours…"
+        }
+        elseif ($null -ne $script:UpdateInfo -and (Test-IsNewerVersion -Candidate $script:UpdateInfo.Version)) {
+            $signedText = if (-not $script:UpdateInfo.SignedAssetAvailable) {
+                "signature en attente"
+            }
+            elseif (-not $script:UpdateInfo.HashAvailable) {
+                "setup signé · checksum absent"
+            }
+            elseif ($script:UpdateReadyPath) {
+                "setup vérifié"
+            }
+            else {
+                "setup signé à vérifier"
+            }
+            $UpdateStateText.Text = "Disponible : $($script:UpdateInfo.Version) · $signedText"
+        }
+        else {
+            $UpdateStateText.Text = "Version installée : $($script:AppVersion)"
+        }
+    }
+}
+
+function Start-UpdateCheck {
+    param([switch]$Force)
+
+    if (-not [bool]$script:Settings.checkUpdates -and -not $Force) {
+        return
+    }
+
+    if ($script:UpdateStage -ne "Idle") {
+        return
+    }
+
+    try {
+        $script:UpdateStage = "Check"
+        $script:UpdateCheckTask = $script:HttpClient.GetStringAsync($GitHubLatestReleaseApi)
+        $script:NextUpdateCheck = [DateTime]::Now.Add($UpdateCheckInterval)
+        Write-Log "INFO" "UPDATE CHECK $GitHubLatestReleaseApi"
+        Update-UpdateUi
+    }
+    catch {
+        $script:UpdateStage = "Idle"
+        Write-Log "WARN" "Vérification mise à jour impossible : $(Get-DeepErrorMessage $_)"
+    }
+}
+
+function Start-UpdateDownload {
+    if ($null -eq $script:UpdateInfo -or -not $script:UpdateInfo.SignedAssetAvailable) {
+        return
+    }
+
+    if ([string]::IsNullOrWhiteSpace([string]$script:UpdateInfo.HashUrl)) {
+        Write-Log "WARN" "Mise à jour automatique refusée : SHA256SUMS.txt absent de la release."
+        return
+    }
+
+    if ($script:UpdateStage -ne "Idle") {
+        return
+    }
+
+    try {
+        $script:UpdateStage = "Hash"
+        $script:UpdateHashTask = $script:HttpClient.GetStringAsync([string]$script:UpdateInfo.HashUrl)
+        Write-Log "INFO" "UPDATE HASH GET $($script:UpdateInfo.HashUrl)"
+        Update-UpdateUi
+    }
+    catch {
+        $script:UpdateStage = "Idle"
+        Write-Log "WARN" "Téléchargement checksum impossible : $(Get-DeepErrorMessage $_)"
+    }
+}
+
+function Test-DownloadedUpdate {
+    param(
+        [string]$Path,
+        [string]$ExpectedHash
+    )
+
+    if (-not (Test-Path $Path)) {
+        return $false
+    }
+
+    try {
+        $actual = (Get-FileHash -Path $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actual -ne $ExpectedHash.ToLowerInvariant()) {
+            Write-Log "ERROR" "Mise à jour rejetée : SHA-256 inattendu ($actual)."
+            return $false
+        }
+
+        $signature = Get-AuthenticodeSignature -FilePath $Path
+        if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
+            Write-Log "WARN" "Mise à jour automatique rejetée : signature Authenticode non valide ($($signature.Status))."
+            return $false
+        }
+
+        $subject = [string]$signature.SignerCertificate.Subject
+        if (-not (Test-ExpectedUpdatePublisher -Subject $subject)) {
+            Write-Log "ERROR" "Mise à jour rejetée : éditeur Authenticode inattendu ($subject)."
+            return $false
+        }
+
+        Write-Log "INFO" "Mise à jour vérifiée : SHA-256 + chaîne Authenticode valides ; éditeur=$subject ; issuer=$($signature.SignerCertificate.Issuer)"
+        return $true
+    }
+    catch {
+        Write-Log "WARN" "Validation de la mise à jour impossible : $(Get-DeepErrorMessage $_)"
+        return $false
+    }
+}
+
+function Invoke-SilentUpdate {
+    if ([string]::IsNullOrWhiteSpace([string]$script:UpdateReadyPath) -or -not (Test-Path $script:UpdateReadyPath)) {
+        if ($script:UpdateInfo -and $script:UpdateInfo.ReleaseUrl) {
+            Start-Process ([string]$script:UpdateInfo.ReleaseUrl)
+        }
+        return
+    }
+
+    try {
+        # Flush the currently displayed controls before handing off to the
+        # updater. This protects selections changed just before an OTA.
+        try {
+            if (-not (Save-UiSettings -ShowValidation $false)) {
+                Write-Log "WARN" "Mise à jour : état UI non persisté car une valeur affichée est invalide."
+            }
+        }
+        catch {
+            Write-Log "WARN" "Mise à jour : sauvegarde UI impossible : $(Get-DeepErrorMessage $_)"
+        }
+
+        $autostartArg = if (Test-RunAtLogon) { "--autostart=1" } else { "--autostart=0" }
+
+        Write-Log "INFO" "Lancement mise à jour silencieuse : $($script:UpdateReadyPath) ; $autostartArg"
+        Start-Process `
+            -FilePath $script:UpdateReadyPath `
+            -ArgumentList @("--silent-update", $autostartArg)
+
+        $script:Exiting = $true
+        try { $script:Timer.Stop() } catch {}
+        try { $notifyIcon.Visible = $false; $notifyIcon.Dispose() } catch {}
+        try { if ($script:TrayIconObject) { $script:TrayIconObject.Dispose() } } catch {}
+        try { $script:HttpClient.Dispose() } catch {}
+        try { $handler.Dispose() } catch {}
+        try { $script:Mutex.ReleaseMutex(); $script:Mutex.Dispose() } catch {}
+        try { $window.Close() } catch {}
+        [System.Windows.Application]::Current.Shutdown()
+    }
+    catch {
+        Write-Log "ERROR" "Lancement de la mise à jour impossible : $(Get-DeepErrorMessage $_)"
+    }
+}
+
+function Process-UpdateState {
+    if ($script:UpdateStage -eq "Check" -and $script:UpdateCheckTask -and $script:UpdateCheckTask.IsCompleted) {
+        try {
+            $json = $script:UpdateCheckTask.GetAwaiter().GetResult()
+            $release = $json | ConvertFrom-Json
+            $version = ([string]$release.tag_name).TrimStart([char[]]"vV")
+
+            if (-not [string]::IsNullOrWhiteSpace($version) -and (Test-IsNewerVersion -Candidate $version)) {
+                $previousVersion = if ($script:UpdateInfo) { [string]$script:UpdateInfo.Version } else { "" }
+                if ($previousVersion -and $previousVersion -ne $version) {
+                    $script:UpdateReadyPath = $null
+                    $script:UpdateExpectedHash = $null
+                }
+
+                $signedName = Get-SignedSetupAssetName -Version $version
+                $signedAsset = @($release.assets | Where-Object { [string]$_.name -eq $signedName } | Select-Object -First 1)
+                $hashAsset = @($release.assets | Where-Object { [string]$_.name -in @("SHA256-SIGNED.txt", "SHA256SUMS.txt") } | Sort-Object { if ([string]$_.name -eq "SHA256-SIGNED.txt") { 0 } else { 1 } } | Select-Object -First 1)
+
+                $script:UpdateInfo = [pscustomobject]@{
+                    Version = $version
+                    ReleaseUrl = [string]$release.html_url
+                    SignedAssetAvailable = ($signedAsset.Count -gt 0)
+                    HashAvailable = ($hashAsset.Count -gt 0)
+                    SetupUrl = if ($signedAsset.Count -gt 0) { [string]$signedAsset[0].browser_download_url } else { $null }
+                    HashUrl = if ($hashAsset.Count -gt 0) { [string]$hashAsset[0].browser_download_url } else { $null }
+                    SetupName = $signedName
+                }
+
+                Write-Log "INFO" "Mise à jour détectée : $version ; signé=$($script:UpdateInfo.SignedAssetAvailable)"
+                Show-UpdateNotification -Version $version
+            }
+            else {
+                $script:UpdateInfo = $null
+                $script:UpdateReadyPath = $null
+                $script:UpdateExpectedHash = $null
+                Write-Log "DEBUG" "Aucune mise à jour disponible ; courant=$($script:AppVersion), latest=$version"
+            }
+        }
+        catch {
+            Write-Log "WARN" "Réponse GitHub Releases invalide : $(Get-DeepErrorMessage $_)"
+        }
+        finally {
+            $script:UpdateCheckTask = $null
+            $script:UpdateStage = "Idle"
+            Update-UpdateUi
+        }
+
+        if (
+            $script:UpdateInfo -and
+            $script:UpdateInfo.SignedAssetAvailable -and
+            $script:UpdateInfo.HashAvailable -and
+            [bool]$script:Settings.autoUpdate
+        ) {
+            Start-UpdateDownload
+        }
+        return
+    }
+
+    if ($script:UpdateStage -eq "Hash" -and $script:UpdateHashTask -and $script:UpdateHashTask.IsCompleted) {
+        try {
+            $hashText = $script:UpdateHashTask.GetAwaiter().GetResult()
+            $expectedHash = Get-ExpectedHashFromChecksumText `
+                -Text $hashText `
+                -FileName ([string]$script:UpdateInfo.SetupName)
+
+            if ([string]::IsNullOrWhiteSpace($expectedHash)) {
+                throw "Le fichier de sommes SHA-256 ne contient pas $($script:UpdateInfo.SetupName)."
+            }
+
+            $script:UpdateExpectedHash = $expectedHash
+            $script:UpdateStage = "Binary"
+            $script:UpdateBinaryTask = $script:HttpClient.GetByteArrayAsync([string]$script:UpdateInfo.SetupUrl)
+            Write-Log "INFO" "UPDATE BINARY GET $($script:UpdateInfo.SetupUrl)"
+        }
+        catch {
+            Write-Log "WARN" "Checksum mise à jour invalide : $(Get-DeepErrorMessage $_)"
+            $script:UpdateStage = "Idle"
+        }
+        finally {
+            $script:UpdateHashTask = $null
+            Update-UpdateUi
+        }
+        return
+    }
+
+    if ($script:UpdateStage -eq "Binary" -and $script:UpdateBinaryTask -and $script:UpdateBinaryTask.IsCompleted) {
+        try {
+            [byte[]]$bytes = $script:UpdateBinaryTask.GetAwaiter().GetResult()
+            if ($bytes.Length -lt 100000) {
+                throw "Setup téléchargé anormalement petit."
+            }
+
+            $path = Join-Path $UpdateDir ([string]$script:UpdateInfo.SetupName)
+            [IO.File]::WriteAllBytes($path, $bytes)
+
+            if (Test-DownloadedUpdate -Path $path -ExpectedHash $script:UpdateExpectedHash) {
+                $script:UpdateReadyPath = $path
+                Write-Log "INFO" "Mise à jour prête : $path"
+            }
+            else {
+                Remove-Item $path -Force -ErrorAction SilentlyContinue
+                $script:UpdateReadyPath = $null
+            }
+        }
+        catch {
+            Write-Log "WARN" "Téléchargement mise à jour impossible : $(Get-DeepErrorMessage $_)"
+        }
+        finally {
+            $script:UpdateBinaryTask = $null
+            $script:UpdateStage = "Idle"
+            Update-UpdateUi
+        }
+
+        if ($script:UpdateReadyPath -and [bool]$script:Settings.autoUpdate) {
+            Invoke-SilentUpdate
+        }
+    }
+}
+
+function Remove-StaleUpdateFiles {
+    try {
+        $cutoff = [DateTime]::Now.AddDays(-1 * $UpdateRetentionDays)
+        Get-ChildItem -Path $UpdateDir -File -Filter "WallhavenRotator-Setup-v*.exe" -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTime -lt $cutoff } |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+    }
+    catch {}
+}
+
+Remove-StaleUpdateFiles
+
 # HttpClient asynchrone.
 $handler = New-Object System.Net.Http.HttpClientHandler
 
@@ -710,6 +1359,8 @@ $script:ApiUsedResolution = $true
 $script:ApiAttempt = 0
 $script:ApiCurrentPage = 1
 $script:PagesTried = @()
+$script:PageCeilings = @{}
+$script:ApiQueryKey = $null
 $script:PendingManual = $false
 $script:HistoryIds = Load-WallpaperHistory
 if ($null -eq $script:HistoryIds) {
@@ -722,6 +1373,15 @@ $script:LastWallpaperUrl = $null
 $script:LastWallpaperFilePath = $null
 $script:LastStatus = ""
 $script:Exiting = $false
+$script:UpdateStage = "Idle"
+$script:UpdateCheckTask = $null
+$script:UpdateHashTask = $null
+$script:UpdateBinaryTask = $null
+$script:UpdateInfo = $null
+$script:UpdateExpectedHash = $null
+$script:UpdateReadyPath = $null
+$script:UpdateNotifiedVersion = [string]$script:Settings.lastNotifiedUpdate
+$script:NextUpdateCheck = [DateTime]::Now.AddSeconds(5)
 
 [xml]$xaml = @'
 <Window
@@ -731,7 +1391,7 @@ $script:Exiting = $false
     Width="560"
     SizeToContent="Height"
     MinHeight="430"
-    MaxHeight="760"
+    MaxHeight="900"
     WindowStartupLocation="CenterScreen"
     WindowStyle="None"
     ResizeMode="NoResize"
@@ -801,7 +1461,7 @@ $script:Exiting = $false
                                FontWeight="SemiBold"
                                FontSize="15"
                                VerticalAlignment="Center"/>
-                    <TextBlock x:Name="VersionText" Text="v1.0.1"
+                    <TextBlock x:Name="VersionText" Text="v1.1.0"
                                Foreground="{StaticResource Muted}"
                                FontSize="11"
                                Margin="9,2,0,0"
@@ -858,6 +1518,39 @@ $script:Exiting = $false
                                    FontSize="11"
                                    VerticalAlignment="Center"
                                    Margin="15,0,0,0"/>
+                    </Grid>
+                </Border>
+
+                <Border x:Name="UpdateBanner"
+                        Visibility="Collapsed"
+                        Background="#24372E"
+                        BorderBrush="#478463"
+                        BorderThickness="1"
+                        CornerRadius="9"
+                        Padding="12"
+                        Margin="0,10,0,0">
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <StackPanel>
+                            <TextBlock x:Name="UpdateBannerTitle"
+                                       Text="Mise à jour disponible"
+                                       FontWeight="SemiBold"
+                                       Foreground="#A9E9C3"/>
+                            <TextBlock x:Name="UpdateBannerText"
+                                       Text="Une nouvelle version est disponible."
+                                       Foreground="{StaticResource Muted}"
+                                       FontSize="10.5"
+                                       Margin="0,3,8,0"
+                                       TextWrapping="Wrap"/>
+                        </StackPanel>
+                        <Button x:Name="UpdateActionButton"
+                                Grid.Column="1"
+                                Content="Mettre à jour"
+                                Padding="12,6"
+                                VerticalAlignment="Center"/>
                     </Grid>
                 </Border>
 
@@ -934,6 +1627,10 @@ $script:Exiting = $false
                           Header="Options"
                           Margin="0,15,0,0"
                           Foreground="#F4F7F5">
+                    <ScrollViewer x:Name="OptionsScrollViewer"
+                                  VerticalScrollBarVisibility="Auto"
+                                  HorizontalScrollBarVisibility="Disabled"
+                                  PanningMode="VerticalOnly">
                     <Border Background="{StaticResource Panel2}"
                             BorderBrush="{StaticResource Stroke}"
                             BorderThickness="1"
@@ -949,6 +1646,92 @@ $script:Exiting = $false
                                        FontSize="10.5"
                                        TextWrapping="Wrap"
                                        Margin="22,6,0,0"/>
+
+                            <Border Background="#293238"
+                                    BorderBrush="{StaticResource Stroke}"
+                                    BorderThickness="1"
+                                    CornerRadius="8"
+                                    Padding="10"
+                                    Margin="0,12,0,0">
+                                <StackPanel>
+                                    <TextBlock Text="AFFICHAGE"
+                                               Foreground="{StaticResource Accent}"
+                                               FontWeight="SemiBold"
+                                               FontSize="10"/>
+                                    <Grid Margin="0,8,0,0">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="10"/>
+                                            <ColumnDefinition Width="*"/>
+                                        </Grid.ColumnDefinitions>
+                                        <StackPanel Grid.Column="0">
+                                            <TextBlock Text="Mode" Foreground="{StaticResource Muted}" FontSize="10" Margin="0,0,0,4"/>
+                                            <ComboBox x:Name="ResolutionModeCombo"/>
+                                        </StackPanel>
+                                        <StackPanel Grid.Column="2">
+                                            <TextBlock Text="Résolution personnalisée" Foreground="{StaticResource Muted}" FontSize="10" Margin="0,0,0,4"/>
+                                            <Grid>
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="24"/>
+                                                    <ColumnDefinition Width="*"/>
+                                                </Grid.ColumnDefinitions>
+                                                <TextBox x:Name="CustomWidthText" Grid.Column="0"/>
+                                                <TextBlock Grid.Column="1" Text="×" HorizontalAlignment="Center" VerticalAlignment="Center" Foreground="{StaticResource Muted}"/>
+                                                <TextBox x:Name="CustomHeightText" Grid.Column="2"/>
+                                            </Grid>
+                                        </StackPanel>
+                                    </Grid>
+                                    <Grid Margin="0,8,0,0">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="10"/>
+                                            <ColumnDefinition Width="*"/>
+                                        </Grid.ColumnDefinitions>
+                                        <StackPanel Grid.Column="0">
+                                            <TextBlock Text="Correspondance" Foreground="{StaticResource Muted}" FontSize="10" Margin="0,0,0,4"/>
+                                            <ComboBox x:Name="ResolutionMatchCombo"/>
+                                        </StackPanel>
+                                        <StackPanel Grid.Column="2">
+                                            <TextBlock Text="Ratio" Foreground="{StaticResource Muted}" FontSize="10" Margin="0,0,0,4"/>
+                                            <ComboBox x:Name="CustomRatioCombo"/>
+                                        </StackPanel>
+                                    </Grid>
+                                    <TextBlock x:Name="ResolutionInfoText"
+                                               Foreground="{StaticResource Muted}"
+                                               FontSize="10.5"
+                                               Margin="0,7,0,0"
+                                               TextWrapping="Wrap"/>
+                                </StackPanel>
+                            </Border>
+
+                            <Border Background="#293238"
+                                    BorderBrush="{StaticResource Stroke}"
+                                    BorderThickness="1"
+                                    CornerRadius="8"
+                                    Padding="10"
+                                    Margin="0,9,0,0">
+                                <StackPanel>
+                                    <TextBlock Text="MISES À JOUR"
+                                               Foreground="{StaticResource Accent}"
+                                               FontWeight="SemiBold"
+                                               FontSize="10"/>
+                                    <CheckBox x:Name="CheckUpdatesCheck"
+                                              Content="Vérifier automatiquement les nouvelles versions"
+                                              Margin="0,8,0,0"/>
+                                    <CheckBox x:Name="AutoUpdateCheck"
+                                              Content="Installer automatiquement les mises à jour signées"
+                                              Margin="0,6,0,0"/>
+                                    <TextBlock x:Name="UpdateStateText"
+                                               Text="Version installée"
+                                               Foreground="{StaticResource Muted}"
+                                               FontSize="10.5"
+                                               Margin="22,6,0,0"/>
+                                    <Button x:Name="CheckUpdateNowButton"
+                                            Content="Vérifier maintenant"
+                                            Margin="0,9,0,0"/>
+                                </StackPanel>
+                            </Border>
 
                             <TextBlock Text="Anti-répétition : 1 000 fonds mémorisés entre les redémarrages · sélection étendue sur plusieurs pages Wallhaven."
                                        Foreground="{StaticResource Muted}"
@@ -984,6 +1767,7 @@ $script:Exiting = $false
                                     IsEnabled="False"/>
                         </StackPanel>
                     </Border>
+                    </ScrollViewer>
                 </Expander>
 
                 <Grid Margin="0,16,0,0">
@@ -1031,7 +1815,22 @@ $AutoRotationCheck = $window.FindName("AutoRotationCheck")
 $ChangeNowButton = $window.FindName("ChangeNowButton")
 $PauseButton = $window.FindName("PauseButton")
 $AdvancedExpander = $window.FindName("AdvancedExpander")
+$OptionsScrollViewer = $window.FindName("OptionsScrollViewer")
+$UpdateBanner = $window.FindName("UpdateBanner")
+$UpdateBannerTitle = $window.FindName("UpdateBannerTitle")
+$UpdateBannerText = $window.FindName("UpdateBannerText")
+$UpdateActionButton = $window.FindName("UpdateActionButton")
 $RunAtLogonCheck = $window.FindName("RunAtLogonCheck")
+$ResolutionModeCombo = $window.FindName("ResolutionModeCombo")
+$ResolutionMatchCombo = $window.FindName("ResolutionMatchCombo")
+$CustomWidthText = $window.FindName("CustomWidthText")
+$CustomHeightText = $window.FindName("CustomHeightText")
+$CustomRatioCombo = $window.FindName("CustomRatioCombo")
+$ResolutionInfoText = $window.FindName("ResolutionInfoText")
+$CheckUpdatesCheck = $window.FindName("CheckUpdatesCheck")
+$AutoUpdateCheck = $window.FindName("AutoUpdateCheck")
+$UpdateStateText = $window.FindName("UpdateStateText")
+$CheckUpdateNowButton = $window.FindName("CheckUpdateNowButton")
 $OpenLogsButton = $window.FindName("OpenLogsButton")
 $OpenFolderButton = $window.FindName("OpenFolderButton")
 $CurrentWallpaperButton = $window.FindName("CurrentWallpaperButton")
@@ -1048,12 +1847,94 @@ foreach ($item in $CategoryNames) {
 foreach ($item in $UnitNames) {
     [void]$UnitCombo.Items.Add($item)
 }
+foreach ($item in $ResolutionModeNames) {
+    [void]$ResolutionModeCombo.Items.Add($item)
+}
+foreach ($item in $ResolutionMatchNames) {
+    [void]$ResolutionMatchCombo.Items.Add($item)
+}
+foreach ($item in $CustomRatioNames) {
+    [void]$CustomRatioCombo.Items.Add($item)
+}
 
 function Set-Status {
     param([string]$Text)
 
     $script:LastStatus = $Text
     $StatusText.Text = $Text
+}
+
+function Update-OptionsViewport {
+    try {
+        $workArea = [System.Windows.SystemParameters]::WorkArea
+
+        # Keep a small visible margin around the window and let only the
+        # variable Options content scroll when vertical room is limited.
+        $maxWindowHeight = [math]::Max(
+            460.0,
+            [double]$workArea.Height - 20.0
+        )
+
+        $window.MaxHeight = $maxWindowHeight
+
+        # Roughly 500 DIPs are occupied by the title bar, main controls,
+        # Options header, action buttons and footer. The remainder belongs
+        # to the scrollable Options body.
+        $optionsHeight = [math]::Max(
+            140.0,
+            $maxWindowHeight - 500.0
+        )
+
+        $OptionsScrollViewer.MaxHeight = $optionsHeight
+    }
+    catch {
+        # Conservative fallback for unusual display/DPI environments.
+        $window.MaxHeight = 900
+        $OptionsScrollViewer.MaxHeight = 380
+    }
+}
+
+function Refresh-ResolutionUi {
+    $customEnabled = ([string]$ResolutionModeCombo.SelectedItem -eq "Personnalisé")
+
+    $CustomWidthText.IsEnabled = $customEnabled
+    $CustomHeightText.IsEnabled = $customEnabled
+    $ResolutionMatchCombo.IsEnabled = $customEnabled
+    $CustomRatioCombo.IsEnabled = $customEnabled
+
+    try {
+        if ($customEnabled) {
+            $w = 0
+            $h = 0
+            if (
+                [int]::TryParse([string]$CustomWidthText.Text, [ref]$w) -and
+                [int]::TryParse([string]$CustomHeightText.Text, [ref]$h) -and
+                $w -gt 0 -and
+                $h -gt 0
+            ) {
+                $choice = [string]$CustomRatioCombo.SelectedItem
+                $ratio = Convert-WallhavenRatioChoice -Choice $choice -Width $w -Height $h
+                $match = if ($ResolutionMatchCombo.SelectedItem) {
+                    [string]$ResolutionMatchCombo.SelectedItem
+                } else {
+                    "Au moins"
+                }
+
+                $ResolutionInfoText.Text = "Cible personnalisée : $w×$h · $($ratio.Replace('x', ':')) · $($match.ToLowerInvariant())"
+            }
+            else {
+                $ResolutionInfoText.Text = "Saisissez une largeur et une hauteur valides."
+            }
+        }
+        else {
+            $screen = Get-PrimaryResolution
+            $ratio = Get-WallhavenRatioForSize -Width $screen.Width -Height $screen.Height
+            $ResolutionInfoText.Text = "Écran principal : $($screen.Width)×$($screen.Height) · $($ratio.Replace('x', ':')) · au moins"
+        }
+    }
+    catch {
+        $ResolutionInfoText.Text = "Filtre d'affichage indisponible."
+    }
 }
 
 function Sync-UiFromSettings {
@@ -1063,6 +1944,17 @@ function Sync-UiFromSettings {
     $UnitCombo.SelectedItem = [string]$script:Settings.unit
     $AutoRotationCheck.IsChecked = [bool]$script:Settings.autoRotation
     $RunAtLogonCheck.IsChecked = Test-RunAtLogon
+    $ResolutionModeCombo.SelectedItem = [string]$script:Settings.resolutionMode
+    $ResolutionMatchCombo.SelectedItem = [string]$script:Settings.resolutionMatch
+    $CustomWidthText.Text = [string][int]$script:Settings.customWidth
+    $CustomHeightText.Text = [string][int]$script:Settings.customHeight
+    $CustomRatioCombo.SelectedItem = [string]$script:Settings.customRatio
+    $CheckUpdatesCheck.IsChecked = [bool]$script:Settings.checkUpdates
+    $AutoUpdateCheck.IsChecked = [bool]$script:Settings.autoUpdate
+    $AutoUpdateCheck.IsEnabled = [bool]$script:Settings.checkUpdates
+
+    Refresh-ResolutionUi
+    Update-UpdateUi
 }
 
 function Save-UiSettings {
@@ -1088,9 +1980,37 @@ function Save-UiSettings {
     if (
         $null -eq $SortCombo.SelectedItem -or
         $null -eq $CategoryCombo.SelectedItem -or
-        $null -eq $UnitCombo.SelectedItem
+        $null -eq $UnitCombo.SelectedItem -or
+        $null -eq $ResolutionModeCombo.SelectedItem -or
+        $null -eq $ResolutionMatchCombo.SelectedItem -or
+        $null -eq $CustomRatioCombo.SelectedItem
     ) {
         return $false
+    }
+
+    $customWidth = 0
+    $customHeight = 0
+    if ([string]$ResolutionModeCombo.SelectedItem -eq "Personnalisé") {
+        if (
+            -not [int]::TryParse([string]$CustomWidthText.Text, [ref]$customWidth) -or
+            -not [int]::TryParse([string]$CustomHeightText.Text, [ref]$customHeight) -or
+            $customWidth -lt 640 -or $customWidth -gt 15360 -or
+            $customHeight -lt 480 -or $customHeight -gt 8640
+        ) {
+            if ($ShowValidation) {
+                [System.Windows.MessageBox]::Show(
+                    "La résolution personnalisée doit être comprise entre 640×480 et 15360×8640.",
+                    "Wallhaven Rotator",
+                    [System.Windows.MessageBoxButton]::OK,
+                    [System.Windows.MessageBoxImage]::Warning
+                ) | Out-Null
+            }
+            return $false
+        }
+    }
+    else {
+        $customWidth = [int]$script:Settings.customWidth
+        $customHeight = [int]$script:Settings.customHeight
     }
 
     $script:Settings.sort = [string]$SortCombo.SelectedItem
@@ -1098,9 +2018,25 @@ function Save-UiSettings {
     $script:Settings.value = $value
     $script:Settings.unit = [string]$UnitCombo.SelectedItem
     $script:Settings.autoRotation = [bool]$AutoRotationCheck.IsChecked
+    $script:Settings.resolutionMode = [string]$ResolutionModeCombo.SelectedItem
+    $script:Settings.resolutionMatch = [string]$ResolutionMatchCombo.SelectedItem
+    $script:Settings.customWidth = $customWidth
+    $script:Settings.customHeight = $customHeight
+    $script:Settings.customRatio = [string]$CustomRatioCombo.SelectedItem
+    $script:Settings.checkUpdates = [bool]$CheckUpdatesCheck.IsChecked
+    $script:Settings.autoUpdate = [bool]$AutoUpdateCheck.IsChecked
 
     $script:Running = [bool]$script:Settings.autoRotation
     Save-Settings
+
+    Refresh-ResolutionUi
+
+    if ([bool]$script:Settings.checkUpdates) {
+        $script:NextUpdateCheck = [DateTime]::Now
+    }
+    else {
+        $script:NextUpdateCheck = [DateTime]::MaxValue
+    }
 
     $wantedAutostart = [bool]$RunAtLogonCheck.IsChecked
     if ($wantedAutostart -ne (Test-RunAtLogon)) {
@@ -1121,6 +2057,7 @@ function Save-UiSettings {
 
 function Show-SettingsWindow {
     Sync-UiFromSettings
+    Update-OptionsViewport
     $window.ShowInTaskbar = $true
     $window.Show()
     $window.WindowState = [System.Windows.WindowState]::Normal
@@ -1131,6 +2068,56 @@ function Hide-SettingsWindow {
     $window.Hide()
     $window.ShowInTaskbar = $false
 }
+
+$AdvancedExpander.Add_Expanded({
+    Update-OptionsViewport
+})
+
+$ResolutionModeCombo.Add_SelectionChanged({
+    Refresh-ResolutionUi
+})
+$ResolutionMatchCombo.Add_SelectionChanged({
+    Refresh-ResolutionUi
+})
+$CustomRatioCombo.Add_SelectionChanged({
+    Refresh-ResolutionUi
+})
+$CustomWidthText.Add_TextChanged({
+    Refresh-ResolutionUi
+})
+$CustomHeightText.Add_TextChanged({
+    Refresh-ResolutionUi
+})
+
+$CheckUpdatesCheck.Add_Checked({
+    $AutoUpdateCheck.IsEnabled = $true
+})
+$CheckUpdatesCheck.Add_Unchecked({
+    $AutoUpdateCheck.IsEnabled = $false
+})
+
+$CheckUpdateNowButton.Add_Click({
+    Start-UpdateCheck -Force
+})
+
+$UpdateActionButton.Add_Click({
+    if ($script:UpdateReadyPath) {
+        Invoke-SilentUpdate
+    }
+    elseif (
+        $script:UpdateInfo -and
+        $script:UpdateInfo.SignedAssetAvailable -and
+        $script:UpdateInfo.HashAvailable
+    ) {
+        Start-UpdateDownload
+    }
+    elseif ($script:UpdateInfo -and $script:UpdateInfo.ReleaseUrl) {
+        Start-Process ([string]$script:UpdateInfo.ReleaseUrl)
+    }
+    else {
+        Start-Process $GitHubReleasesUrl
+    }
+})
 
 $DragSurface.Add_MouseLeftButtonDown({
     try {
@@ -1242,7 +2229,8 @@ function Start-ApiRequest {
             Set-Status "Recherche d'un fond sur Wallhaven..."
         }
 
-        Write-Log "INFO" "API GET $url ; tentative=$($script:ApiAttempt) ; historique=$($script:HistoryIds.Count)/$HistoryMaxIds"
+        $target = Get-TargetDisplayFilter
+        Write-Log "INFO" "API GET $url ; tentative=$($script:ApiAttempt) ; historique=$($script:HistoryIds.Count)/$HistoryMaxIds ; cible=$($target.Width)x$($target.Height) ratio=$($target.Ratio) mode=$($target.Source) match=$($target.MatchMode)"
     }
     catch {
         Handle-RequestFailure -Message (Get-DeepErrorMessage $_)
@@ -1260,14 +2248,19 @@ function Retry-ApiSelection {
         return $true
     }
 
-    if ([bool]$script:ApiUsedResolution) {
-        Write-Log "INFO" "Sélection difficile avec filtre résolution ; nouvel essai sans filtre minimum."
+    $target = Get-TargetDisplayFilter
+    if (Test-ResolutionFallbackAllowed -Target $target -UseResolution ([bool]$script:ApiUsedResolution)) {
+        Write-Log "INFO" "Sélection difficile avec résolution minimale ; nouvel essai sans minimum mais en conservant le ratio $($target.Ratio)."
         $script:ApiAttempt = 0
         $script:PagesTried = @()
         $script:ApiTask = $null
         $script:State = "Idle"
         Start-ApiRequest -UseResolution $false
         return $true
+    }
+
+    if ([bool]$target.IsExact) {
+        Write-Log "INFO" "Mode résolution exacte : aucun élargissement automatique du filtre."
     }
 
     return $false
@@ -1388,6 +2381,13 @@ function Process-AsyncState {
 
             $response = $json | ConvertFrom-Json
             $data = @($response.data)
+
+            try {
+                $lastPage = [int]$response.meta.last_page
+                if ($script:ApiQueryKey -and $lastPage -gt 0) {
+                    $script:PageCeilings[$script:ApiQueryKey] = $lastPage
+                }
+            } catch {}
 
             if ($data.Count -eq 0) {
                 if (Retry-ApiSelection -Reason "page vide") {
@@ -1620,6 +2620,8 @@ function Update-UiState {
     else {
         $NextChangeText.Text = "pause"
     }
+
+    Update-UpdateUi
 }
 
 $ChangeNowButton.Add_Click({
@@ -1727,6 +2729,15 @@ $script:Timer.Interval = [TimeSpan]::FromMilliseconds(300)
 
 $script:Timer.Add_Tick({
     Process-AsyncState
+    Process-UpdateState
+
+    if (
+        [bool]$script:Settings.checkUpdates -and
+        $script:UpdateStage -eq "Idle" -and
+        [DateTime]::Now -ge $script:NextUpdateCheck
+    ) {
+        Start-UpdateCheck
+    }
 
     if (Test-Path $ShowRequestPath) {
         try {
@@ -1765,8 +2776,9 @@ $startupMethod = try {
     "<aucun>"
 }
 
+$startupTarget = Get-TargetDisplayFilter
 Write-Log "INFO" (
-    "Wallhaven Rotator v{0} démarré. Auto={1}; PID={2}; Run={3}; historique={4}/{5}; cacheMax={6} fichiers/{7} MiB" -f `
+    "Wallhaven Rotator v{0} démarré. Auto={1}; PID={2}; Run={3}; historique={4}/{5}; cacheMax={6} fichiers/{7} MiB; cible={8}x{9}; ratio={10}; match={11}; updates={12}; autoUpdate={13}" -f `
     $script:AppVersion,
     [bool]$Autostart,
     $PID,
@@ -1774,7 +2786,13 @@ Write-Log "INFO" (
     $script:HistoryIds.Count,
     $HistoryMaxIds,
     $CacheMaxFiles,
-    [int]($CacheMaxBytes / 1MB)
+    [int]($CacheMaxBytes / 1MB),
+    $startupTarget.Width,
+    $startupTarget.Height,
+    $startupTarget.Ratio,
+    $startupTarget.MatchMode,
+    [bool]$script:Settings.checkUpdates,
+    [bool]$script:Settings.autoUpdate
 )
 
 if ($script:Running) {

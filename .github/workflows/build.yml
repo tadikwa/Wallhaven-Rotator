@@ -31,6 +31,29 @@ jobs:
         shell: pwsh
         run: powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\tests\HistoryInitialization.Tests.ps1
 
+      - name: Display ratio mapping tests (Windows PowerShell 5.1)
+        shell: pwsh
+        run: powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\tests\DisplayFilter.Tests.ps1
+
+      - name: Update helper tests (Windows PowerShell 5.1)
+        shell: pwsh
+        run: powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\tests\UpdateHelpers.Tests.ps1
+
+      - name: Prepare setup payload for Go tests
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path setup/payload -Force | Out-Null
+          Copy-Item src/Wallhaven-Wallpaper-Tray.ps1 setup/payload/Wallhaven-Wallpaper-Tray.ps1 -Force
+          Copy-Item src/Wallhaven-Rotator-Launcher.vbs setup/payload/Wallhaven-Rotator-Launcher.vbs -Force
+          Copy-Item src/README-runtime.txt setup/payload/README.txt -Force
+          Copy-Item assets/Wallhaven-Rotator.ico setup/payload/Wallhaven-Rotator.ico -Force
+          Copy-Item assets/Wallhaven-Rotator.png setup/payload/Wallhaven-Rotator.png -Force
+
+      - name: Setup Go tests
+        shell: pwsh
+        working-directory: setup
+        run: go test ./...
+
       - name: Build unsigned setup
         shell: pwsh
         run: ./scripts/Build.ps1
