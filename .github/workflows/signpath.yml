@@ -1,0 +1,131 @@
+name: Sign release with SignPath
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing GitHub release tag to sign'
+        required: true
+        default: 'v1.0.0'
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  build-and-sign:
+    if: ${{ vars.SIGNPATH_ENABLED == 'true' }}
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+
+      - name: Read version from tag
+        id: version
+        shell: pwsh
+        run: |
+          $tag = "${{ inputs.tag }}"
+          if ($tag -notmatch '^v(\d+\.\d+\.\d+)$') {
+            throw "Tag must be vX.Y.Z"
+          }
+          $version = $Matches[1]
+          $canonical = (Get-Content VERSION -Raw).Trim()
+          if ($version -ne $canonical) {
+            throw "Tag version '$version' != VERSION '$canonical'"
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.23.2'
+          cache: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13.5'
+
+      - name: Build unsigned setup from release source
+        shell: pwsh
+        run: ./scripts/Build.ps1 -Version "${{ steps.version.outputs.version }}"
+
+      - name: Upload unsigned artifact for SignPath origin verification
+        id: upload-unsigned
+        uses: actions/upload-artifact@v7
+        with:
+          name: WallhavenRotator-SignPath-input
+          path: dist/WallhavenRotator-Setup-v${{ steps.version.outputs.version }}.exe
+          if-no-files-found: error
+          # Direct file artifact: our SignPath artifact configuration has <pe-file>
+          # as its root. With the default archive=true, GitHub would send a ZIP.
+          archive: false
+
+      - name: Submit SignPath signing request
+        id: signpath
+        uses: signpath/github-action-submit-signing-request@v2
+        with:
+          api-token: '${{ secrets.SIGNPATH_API_TOKEN }}'
+          organization-id: '${{ vars.SIGNPATH_ORGANIZATION_ID }}'
+          project-slug: '${{ vars.SIGNPATH_PROJECT_SLUG }}'
+          signing-policy-slug: '${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}'
+          artifact-configuration-slug: '${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}'
+          github-artifact-id: '${{ steps.upload-unsigned.outputs.artifact-id }}'
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: dist-signed
+
+      - name: Locate and verify signed executable
+        id: signed
+        shell: pwsh
+        run: |
+          $v = "${{ steps.version.outputs.version }}"
+          $signed = Get-ChildItem dist-signed -Recurse -File -Filter *.exe | Select-Object -First 1
+          if (-not $signed) {
+            throw "No signed executable returned by SignPath."
+          }
+
+          $targetDir = "dist-release"
+          New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+          $target = Join-Path $targetDir "WallhavenRotator-Setup-v$v.exe"
+          Copy-Item $signed.FullName $target -Force
+
+          $signature = Get-AuthenticodeSignature $target
+          if ($signature.Status -ne 'Valid') {
+            throw "Authenticode signature is not valid: $($signature.Status)"
+          }
+
+          $hash = Get-FileHash $target -Algorithm SHA256
+          "{0}  WallhavenRotator-Setup-v{1}.exe" -f $hash.Hash.ToLowerInvariant(), $v |
+            Set-Content (Join-Path $targetDir "SHA256-SIGNED.txt") -Encoding ASCII
+
+      - name: Add signed installer to existing GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ inputs.tag }}"
+          $v = "${{ steps.version.outputs.version }}"
+
+          gh release upload $tag `
+            "dist-release/WallhavenRotator-Setup-v$v.exe#Signed installer" `
+            "dist-release/SHA256-SIGNED.txt#SHA-256 of signed installer" `
+            --clobber
+
+          $body = gh release view $tag --json body --jq .body
+          if ($body -notmatch 'Signed installer available') {
+            $body += @"
+
+          ---
+
+          **Signed installer available:** `WallhavenRotator-Setup-v$v.exe`
+
+          Free code signing provided by SignPath.io, certificate by SignPath Foundation.
+          "@
+            $body | Set-Content release-notes-signed.md -Encoding UTF8
+            gh release edit $tag --notes-file release-notes-signed.md
+          }

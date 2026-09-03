@@ -1,0 +1,88 @@
+name: Publish first unsigned release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Public release version'
+        required: true
+        default: '1.0.0'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Validate version
+        shell: pwsh
+        run: |
+          $expected = (Get-Content VERSION -Raw).Trim()
+          if ("${{ inputs.version }}" -ne $expected) {
+            throw "Workflow version '${{ inputs.version }}' != VERSION '$expected'"
+          }
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.23.2'
+          cache: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13.5'
+
+      - name: Build unsigned setup
+        shell: pwsh
+        run: ./scripts/Build.ps1 -Version "${{ inputs.version }}"
+
+      - name: Prepare unsigned public asset
+        shell: pwsh
+        run: |
+          $v = "${{ inputs.version }}"
+          Copy-Item "dist/WallhavenRotator-Setup-v$v.exe" "dist/WallhavenRotator-Setup-v$v-unsigned.exe"
+          $hash = Get-FileHash "dist/WallhavenRotator-Setup-v$v-unsigned.exe" -Algorithm SHA256
+          "{0}  WallhavenRotator-Setup-v{1}-unsigned.exe" -f $hash.Hash.ToLowerInvariant(), $v |
+            Set-Content "dist/SHA256SUMS.txt" -Encoding ASCII
+
+      - name: Create public GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $v = "${{ inputs.version }}"
+          $tag = "v$v"
+          $notes = @"
+          # Wallhaven Rotator $v
+
+          First public release of Wallhaven Rotator.
+
+          The installer in this initial publication is intentionally **unsigned** while the project applies to SignPath Foundation. It is built by this GitHub Actions workflow from the public source repository.
+
+          After SignPath Foundation approval, the signed installer will be added to this same release as `WallhavenRotator-Setup-v$v.exe`; the original unsigned asset remains available for provenance.
+
+          ## Code signing policy
+
+          See [CODE_SIGNING.md](https://github.com/${{ github.repository }}/blob/${{ github.sha }}/CODE_SIGNING.md).
+
+          Free code signing provided by SignPath.io, certificate by SignPath Foundation.
+
+          ## Privacy
+
+          See [PRIVACY.md](https://github.com/${{ github.repository }}/blob/${{ github.sha }}/PRIVACY.md).
+          "@
+
+          $notes | Set-Content release-notes.md -Encoding UTF8
+
+          gh release create $tag `
+            "dist/WallhavenRotator-Setup-v$v-unsigned.exe#Unsigned installer (initial public release)" `
+            "dist/SHA256SUMS.txt#SHA-256 checksums" `
+            --target "${{ github.sha }}" `
+            --title "Wallhaven Rotator $v" `
+            --notes-file release-notes.md
