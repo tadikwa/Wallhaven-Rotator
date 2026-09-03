@@ -1,4 +1,4 @@
-Wallhaven Rotator 1.0.0
+﻿Wallhaven Rotator 1.0.1
 =========================
 
 Wallhaven Rotator change automatiquement le fond d'écran Windows à partir de

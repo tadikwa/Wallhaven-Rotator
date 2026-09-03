@@ -27,6 +27,10 @@ jobs:
         with:
           python-version: '3.13.5'
 
+      - name: Regression test - fresh history initialization (Windows PowerShell 5.1)
+        shell: pwsh
+        run: powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\tests\HistoryInitialization.Tests.ps1
+
       - name: Build unsigned setup
         shell: pwsh
         run: ./scripts/Build.ps1

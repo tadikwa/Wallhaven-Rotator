@@ -6,7 +6,7 @@
 # Version épurée : rotation du wallpaper Wallhaven uniquement.
 
 $ErrorActionPreference = "Stop"
-$script:AppVersion = "1.0.0"
+$script:AppVersion = "1.0.1"
 
 Add-Type -AssemblyName PresentationFramework
 Add-Type -AssemblyName PresentationCore
@@ -323,7 +323,10 @@ function Load-WallpaperHistory {
     $list = New-Object 'System.Collections.Generic.List[string]'
 
     if (-not (Test-Path $HistoryPath)) {
-        return $list
+        # Keep the generic List object intact. PowerShell otherwise enumerates
+        # collection output and an empty list becomes $null to the caller.
+        Write-Output -NoEnumerate $list
+        return
     }
 
     try {
@@ -353,7 +356,8 @@ function Load-WallpaperHistory {
         $list.Clear()
     }
 
-    return $list
+    # Always return the List object itself, even when it contains 0 or 1 item.
+    Write-Output -NoEnumerate $list
 }
 
 function Save-WallpaperHistory {
@@ -382,6 +386,11 @@ function Add-WallpaperToHistory {
 
     if ([string]::IsNullOrWhiteSpace($Id)) {
         return
+    }
+
+    # Defensive recovery for upgrades or a corrupted initialization state.
+    if ($null -eq $script:HistoryIds) {
+        $script:HistoryIds = New-Object 'System.Collections.Generic.List[string]'
     }
 
     while ($script:HistoryIds.Contains($Id)) {
@@ -703,6 +712,11 @@ $script:ApiCurrentPage = 1
 $script:PagesTried = @()
 $script:PendingManual = $false
 $script:HistoryIds = Load-WallpaperHistory
+if ($null -eq $script:HistoryIds) {
+    # Should not happen after Load-WallpaperHistory's -NoEnumerate return,
+    # but keep startup resilient to future changes.
+    $script:HistoryIds = New-Object 'System.Collections.Generic.List[string]'
+}
 $script:LastWallpaperId = $null
 $script:LastWallpaperUrl = $null
 $script:LastWallpaperFilePath = $null
@@ -787,7 +801,7 @@ $script:Exiting = $false
                                FontWeight="SemiBold"
                                FontSize="15"
                                VerticalAlignment="Center"/>
-                    <TextBlock x:Name="VersionText" Text="v1.0.0"
+                    <TextBlock x:Name="VersionText" Text="v1.0.1"
                                Foreground="{StaticResource Muted}"
                                FontSize="11"
                                Margin="9,2,0,0"
