@@ -1,4 +1,4 @@
-name: Publish first unsigned release
+name: Publish unsigned release
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
       version:
         description: 'Public release version'
         required: true
-        default: '1.0.1'
+        default: '1.1.0'
 
 permissions:
   contents: write
@@ -61,9 +61,9 @@ jobs:
           $notes = @"
           # Wallhaven Rotator $v
 
-          First public release of Wallhaven Rotator.
+          Wallhaven Rotator release `$v` built from the public source repository.
 
-          The installer in this initial publication is intentionally **unsigned** while the project applies to SignPath Foundation. It is built by this GitHub Actions workflow from the public source repository.
+          The unsigned installer is built by this GitHub Actions workflow from the public source repository. When SignPath signing is available, the signed installer is added to the same GitHub Release.
 
           After SignPath Foundation approval, the signed installer will be added to this same release as `WallhavenRotator-Setup-v$v.exe`; the original unsigned asset remains available for provenance.
 
@@ -81,7 +81,7 @@ jobs:
           $notes | Set-Content release-notes.md -Encoding UTF8
 
           gh release create $tag `
-            "dist/WallhavenRotator-Setup-v$v-unsigned.exe#Unsigned installer (initial public release)" `
+            "dist/WallhavenRotator-Setup-v$v-unsigned.exe#Unsigned installer" `
             "dist/SHA256SUMS.txt#SHA-256 checksums" `
             --target "${{ github.sha }}" `
             --title "Wallhaven Rotator $v" `
