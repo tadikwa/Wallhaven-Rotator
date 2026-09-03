@@ -1,4 +1,4 @@
-﻿param(
+param(
     [switch]$Autostart
 )
 
@@ -1156,6 +1156,17 @@ function Invoke-SilentUpdate {
     }
 
     try {
+        # Flush the currently displayed controls before handing off to the
+        # updater. This protects selections changed just before an OTA.
+        try {
+            if (-not (Save-UiSettings -ShowValidation $false)) {
+                Write-Log "WARN" "Mise à jour : état UI non persisté car une valeur affichée est invalide."
+            }
+        }
+        catch {
+            Write-Log "WARN" "Mise à jour : sauvegarde UI impossible : $(Get-DeepErrorMessage $_)"
+        }
+
         $autostartArg = if (Test-RunAtLogon) { "--autostart=1" } else { "--autostart=0" }
 
         Write-Log "INFO" "Lancement mise à jour silencieuse : $($script:UpdateReadyPath) ; $autostartArg"

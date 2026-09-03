@@ -1,4 +1,4 @@
-﻿$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Stop"
 
 $Root = Split-Path -Parent $PSScriptRoot
 $Source = Join-Path $Root "src\Wallhaven-Wallpaper-Tray.ps1"
@@ -72,6 +72,20 @@ if ($parsed -ne $hash) {
 }
 if ($null -ne (Get-ExpectedHashFromChecksumText -Text $text -FileName "other.exe")) {
     throw "Checksum parser matched the wrong file."
+}
+
+$invokeSilentUpdate = $ast.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -eq "Invoke-SilentUpdate"
+}, $true) | Select-Object -First 1
+
+if ($null -eq $invokeSilentUpdate) {
+    throw "Invoke-SilentUpdate function not found."
+}
+
+if ($invokeSilentUpdate.Extent.Text -notmatch 'Save-UiSettings\s+-ShowValidation\s+\$false') {
+    throw "Silent OTA must persist the current settings UI before updater hand-off."
 }
 
 Write-Host "Update helper tests: OK" -ForegroundColor Green

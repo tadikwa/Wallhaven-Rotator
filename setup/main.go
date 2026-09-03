@@ -363,62 +363,68 @@ func atomicWrite(path string, data []byte) error {
 }
 
 func cleanOldSettings(path string) error {
-	def := cleanSettings{
-		Sort: "Aléatoire", Category: "Toutes", Value: 1, Unit: "Minutes", AutoRotation: true,
-		ResolutionMode: "Automatique", ResolutionMatch: "Au moins",
-		CustomWidth: 2560, CustomHeight: 1440, CustomRatio: "Automatique",
-		CheckUpdates: true, AutoUpdate: false, LastNotifiedUpdate: "",
+	defaults := map[string]interface{}{
+		"sort":               "Aléatoire",
+		"category":           "Toutes",
+		"value":              1,
+		"unit":               "Minutes",
+		"autoRotation":       true,
+		"resolutionMode":     "Automatique",
+		"resolutionMatch":    "Au moins",
+		"customWidth":        2560,
+		"customHeight":       1440,
+		"customRatio":        "Automatique",
+		"checkUpdates":       true,
+		"autoUpdate":         false,
+		"lastNotifiedUpdate": "",
 	}
+
 	data, err := os.ReadFile(path)
-	if err == nil {
-		data = bytes.TrimPrefix(data, []byte{0xEF, 0xBB, 0xBF})
-		var raw map[string]interface{}
-		if json.Unmarshal(data, &raw) == nil {
-			if s, ok := raw["sort"].(string); ok && contains([]string{"Tendance", "Populaires", "Nouveaux", "Aléatoire"}, s) {
-				def.Sort = s
-			}
-			if s, ok := raw["category"].(string); ok && contains([]string{"Général", "Anime", "Personnes", "Toutes"}, s) {
-				def.Category = s
-			}
-			if s, ok := raw["unit"].(string); ok && contains([]string{"Minutes", "Heures", "Jours"}, s) {
-				def.Unit = s
-			}
-			if n, ok := raw["value"].(float64); ok && int(n) >= 1 && int(n) <= 999 {
-				def.Value = int(n)
-			}
-			if b, ok := raw["autoRotation"].(bool); ok {
-				def.AutoRotation = b
-			}
-			if m, ok := raw["resolutionMode"].(string); ok && contains([]string{"Automatique", "Personnalisé"}, m) {
-				def.ResolutionMode = m
-			}
-			if m, ok := raw["resolutionMatch"].(string); ok && contains([]string{"Au moins", "Exacte"}, m) {
-				def.ResolutionMatch = m
-			}
-			if n, ok := raw["customWidth"].(float64); ok && int(n) >= 640 && int(n) <= 15360 {
-				def.CustomWidth = int(n)
-			}
-			if n, ok := raw["customHeight"].(float64); ok && int(n) >= 480 && int(n) <= 8640 {
-				def.CustomHeight = int(n)
-			}
-			if ratio, ok := raw["customRatio"].(string); ok && contains([]string{
-				"Automatique", "16:9", "16:10", "21:9", "32:9", "48:9",
-				"4:3", "5:4", "3:2", "1:1", "10:16", "9:16", "9:18",
-			}, ratio) {
-				def.CustomRatio = ratio
-			}
-			if b, ok := raw["checkUpdates"].(bool); ok {
-				def.CheckUpdates = b
-			}
-			if b, ok := raw["autoUpdate"].(bool); ok {
-				def.AutoUpdate = b
-			}
-			if value, ok := raw["lastNotifiedUpdate"].(string); ok {
-				def.LastNotifiedUpdate = value
-			}
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return err
 		}
+
+		out, err := json.MarshalIndent(defaults, "", "  ")
+		if err != nil {
+			return err
+		}
+		out = append(out, '\n')
+		return atomicWrite(path, out)
 	}
-	out, _ := json.MarshalIndent(def, "", "  ")
+
+	decoded := bytes.TrimPrefix(data, []byte{0xEF, 0xBB, 0xBF})
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(decoded, &raw); err != nil {
+		return fmt.Errorf("existing settings.json is invalid JSON: %w", err)
+	}
+	if raw == nil {
+		raw = map[string]json.RawMessage{}
+	}
+
+	changed := false
+	for key, value := range defaults {
+		if _, exists := raw[key]; exists {
+			continue
+		}
+
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return err
+		}
+		raw[key] = encoded
+		changed = true
+	}
+
+	// Existing complete settings stay byte-for-byte untouched.
+	if !changed {
+		return nil
+	}
+
+	out, err := json.MarshalIndent(raw, "", "  ")
+	if err != nil {
+		return err
+	}
 	out = append(out, '\n')
 	return atomicWrite(path, out)
 }
