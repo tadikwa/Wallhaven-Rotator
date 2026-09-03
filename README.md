@@ -4,6 +4,10 @@ Wallhaven Rotator is a small Windows wallpaper rotator using the public **SFW**
 Wallhaven API. The public version history starts at **1.0.0**.
 
 > This project is not affiliated with or endorsed by Wallhaven.
+## Screenshot
+
+![Wallhaven Rotator](assets/screenshots/wallhaven-rotator-ui.png)
+
 
 ## Features
 
@@ -70,6 +74,16 @@ Free code signing provided by [SignPath.io](https://signpath.io/), certificate
 by [SignPath Foundation](https://signpath.org/) after project approval.
 
 See [CODE_SIGNING.md](CODE_SIGNING.md).
+
+
+## Roadmap
+
+The next planned public release is **1.1.0**. Work is tracked in:
+
+- [#3 â€” Display-aware resolution and aspect-ratio filtering](../../issues/3)
+- [#4 â€” Update notification and optional silent OTA updates](../../issues/4)
+
+No intermediate public release is planned while these items are being developed and tested.
 
 ## License
 

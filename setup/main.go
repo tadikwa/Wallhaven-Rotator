@@ -101,8 +101,8 @@ const (
 )
 
 var (
-	appVersion   = "1.0.0"
-	setupVersion = "1.0.0"
+	appVersion   = "1.0.1"
+	setupVersion = "1.0.1"
 )
 
 var (
