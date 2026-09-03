@@ -8,7 +8,7 @@ ICO = ROOT / 'payload' / 'Wallhaven-Rotator.ico'
 MANIFEST = ROOT / 'app.manifest'
 OUT = ROOT / 'resources_amd64.syso'
 
-VERSION = os.environ.get('WALLHAVEN_VERSION', '1.0.1').strip()
+VERSION = os.environ.get('WALLHAVEN_VERSION', '1.1.0').strip()
 if not re.fullmatch(r'\d+\.\d+\.\d+', VERSION):
     raise SystemExit(f'Invalid WALLHAVEN_VERSION: {VERSION!r}')
 MAJOR, MINOR, PATCH = map(int, VERSION.split('.'))

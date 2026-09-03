@@ -19,6 +19,16 @@ Wallhaven Rotator:
 The setup is a native Windows x64 executable compiled with the official Go
 toolchain. It is not packed or obfuscated.
 
+## Updates
+
+Wallhaven Rotator checks public GitHub Releases only when update checks are
+enabled. Silent installation is opt-in and is restricted to a release asset
+named `WallhavenRotator-Setup-vX.Y.Z.exe`. Before execution the application
+requires the published SHA-256 checksum, a valid trusted Authenticode
+signature, and the expected **SignPath Foundation** publisher identity. Unsigned,
+invalidly signed, checksum-mismatched, or unexpected-publisher installers are
+never executed silently.
+
 ## Reporting
 
 Please use the repository's GitHub Issues for non-sensitive bugs.

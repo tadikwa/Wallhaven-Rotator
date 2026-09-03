@@ -6,7 +6,7 @@ on:
       tag:
         description: 'Existing GitHub release tag to sign'
         required: true
-        default: 'v1.0.0'
+        default: 'v1.1.0'
 
 permissions:
   contents: write
@@ -97,6 +97,14 @@ jobs:
           $signature = Get-AuthenticodeSignature $target
           if ($signature.Status -ne 'Valid') {
             throw "Authenticode signature is not valid: $($signature.Status)"
+          }
+
+          $subject = [string]$signature.SignerCertificate.Subject
+          if (
+            $subject -notmatch '(^|,\s*)CN=SignPath Foundation(,|$)' -or
+            $subject -notmatch '(^|,\s*)O=SignPath Foundation(,|$)'
+          ) {
+            throw "Unexpected Authenticode publisher: $subject"
           }
 
           $hash = Get-FileHash $target -Algorithm SHA256

@@ -82,6 +82,7 @@ const (
 	COLOR_WINDOW     = 5
 	DEFAULT_GUI_FONT = 17
 
+	KEY_QUERY_VALUE   = 0x0001
 	KEY_SET_VALUE     = 0x0002
 	REG_SZ            = 1
 	HKEY_CURRENT_USER = 0x80000001
@@ -101,8 +102,8 @@ const (
 )
 
 var (
-	appVersion   = "1.0.1"
-	setupVersion = "1.0.1"
+	appVersion   = "1.1.0"
+	setupVersion = "1.1.0"
 )
 
 var (
@@ -138,10 +139,12 @@ var (
 	procOpenMutexW       = kernel32.NewProc("OpenMutexW")
 	procCloseHandle      = kernel32.NewProc("CloseHandle")
 
-	procRegCreateKeyExW = advapi32.NewProc("RegCreateKeyExW")
-	procRegSetValueExW  = advapi32.NewProc("RegSetValueExW")
-	procRegDeleteValueW = advapi32.NewProc("RegDeleteValueW")
-	procRegCloseKey     = advapi32.NewProc("RegCloseKey")
+	procRegCreateKeyExW  = advapi32.NewProc("RegCreateKeyExW")
+	procRegOpenKeyExW    = advapi32.NewProc("RegOpenKeyExW")
+	procRegQueryValueExW = advapi32.NewProc("RegQueryValueExW")
+	procRegSetValueExW   = advapi32.NewProc("RegSetValueExW")
+	procRegDeleteValueW  = advapi32.NewProc("RegDeleteValueW")
+	procRegCloseKey      = advapi32.NewProc("RegCloseKey")
 
 	procShellExecuteW    = shell32.NewProc("ShellExecuteW")
 	procGetStockObject   = gdi32.NewProc("GetStockObject")
@@ -225,11 +228,19 @@ type msg struct {
 }
 
 type cleanSettings struct {
-	Sort         string `json:"sort"`
-	Category     string `json:"category"`
-	Value        int    `json:"value"`
-	Unit         string `json:"unit"`
-	AutoRotation bool   `json:"autoRotation"`
+	Sort               string `json:"sort"`
+	Category           string `json:"category"`
+	Value              int    `json:"value"`
+	Unit               string `json:"unit"`
+	AutoRotation       bool   `json:"autoRotation"`
+	ResolutionMode     string `json:"resolutionMode"`
+	ResolutionMatch    string `json:"resolutionMatch"`
+	CustomWidth        int    `json:"customWidth"`
+	CustomHeight       int    `json:"customHeight"`
+	CustomRatio        string `json:"customRatio"`
+	CheckUpdates       bool   `json:"checkUpdates"`
+	AutoUpdate         bool   `json:"autoUpdate"`
+	LastNotifiedUpdate string `json:"lastNotifiedUpdate"`
 }
 
 type installMarker struct {
@@ -352,30 +363,68 @@ func atomicWrite(path string, data []byte) error {
 }
 
 func cleanOldSettings(path string) error {
-	def := cleanSettings{Sort: "Aléatoire", Category: "Toutes", Value: 1, Unit: "Minutes", AutoRotation: true}
-	data, err := os.ReadFile(path)
-	if err == nil {
-		data = bytes.TrimPrefix(data, []byte{0xEF, 0xBB, 0xBF})
-		var raw map[string]interface{}
-		if json.Unmarshal(data, &raw) == nil {
-			if s, ok := raw["sort"].(string); ok && contains([]string{"Tendance", "Populaires", "Nouveaux", "Aléatoire"}, s) {
-				def.Sort = s
-			}
-			if s, ok := raw["category"].(string); ok && contains([]string{"Général", "Anime", "Personnes", "Toutes"}, s) {
-				def.Category = s
-			}
-			if s, ok := raw["unit"].(string); ok && contains([]string{"Minutes", "Heures", "Jours"}, s) {
-				def.Unit = s
-			}
-			if n, ok := raw["value"].(float64); ok && int(n) >= 1 && int(n) <= 999 {
-				def.Value = int(n)
-			}
-			if b, ok := raw["autoRotation"].(bool); ok {
-				def.AutoRotation = b
-			}
-		}
+	defaults := map[string]interface{}{
+		"sort":               "Aléatoire",
+		"category":           "Toutes",
+		"value":              1,
+		"unit":               "Minutes",
+		"autoRotation":       true,
+		"resolutionMode":     "Automatique",
+		"resolutionMatch":    "Au moins",
+		"customWidth":        2560,
+		"customHeight":       1440,
+		"customRatio":        "Automatique",
+		"checkUpdates":       true,
+		"autoUpdate":         false,
+		"lastNotifiedUpdate": "",
 	}
-	out, _ := json.MarshalIndent(def, "", "  ")
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return err
+		}
+
+		out, err := json.MarshalIndent(defaults, "", "  ")
+		if err != nil {
+			return err
+		}
+		out = append(out, '\n')
+		return atomicWrite(path, out)
+	}
+
+	decoded := bytes.TrimPrefix(data, []byte{0xEF, 0xBB, 0xBF})
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(decoded, &raw); err != nil {
+		return fmt.Errorf("existing settings.json is invalid JSON: %w", err)
+	}
+	if raw == nil {
+		raw = map[string]json.RawMessage{}
+	}
+
+	changed := false
+	for key, value := range defaults {
+		if _, exists := raw[key]; exists {
+			continue
+		}
+
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return err
+		}
+		raw[key] = encoded
+		changed = true
+	}
+
+	// Existing complete settings stay byte-for-byte untouched.
+	if !changed {
+		return nil
+	}
+
+	out, err := json.MarshalIndent(raw, "", "  ")
+	if err != nil {
+		return err
+	}
 	out = append(out, '\n')
 	return atomicWrite(path, out)
 }
@@ -387,6 +436,36 @@ func contains(a []string, s string) bool {
 		}
 	}
 	return false
+}
+
+func runValueExists() bool {
+	const subkey = `Software\Microsoft\Windows\CurrentVersion\Run`
+	var key uintptr
+
+	r, _, _ := procRegOpenKeyExW.Call(
+		HKEY_CURRENT_USER,
+		uintptr(unsafe.Pointer(utf16Ptr(subkey))),
+		0,
+		KEY_QUERY_VALUE,
+		uintptr(unsafe.Pointer(&key)),
+	)
+	if r != 0 {
+		return false
+	}
+	defer procRegCloseKey.Call(key)
+
+	var valueType uint32
+	var size uint32
+	r, _, _ = procRegQueryValueExW.Call(
+		key,
+		uintptr(unsafe.Pointer(utf16Ptr(runValueName))),
+		0,
+		uintptr(unsafe.Pointer(&valueType)),
+		0,
+		uintptr(unsafe.Pointer(&size)),
+	)
+
+	return r == 0 && valueType == REG_SZ && size > 2
 }
 
 func setRunValue(command string) error {
@@ -444,7 +523,7 @@ func removeObsolete(dir string) {
 	_ = os.RemoveAll(filepath.Join(dir, "lockscreen"))
 }
 
-func install() error {
+func installWithLaunch(launchMode string, enableAutostart bool) error {
 	if isRunning() {
 		return fmt.Errorf("Wallhaven Rotator est actuellement en cours d'exécution.\n\nQuittez-le d'abord depuis son icône dans la zone de notification (clic droit > Quitter), puis relancez le setup.")
 	}
@@ -491,8 +570,12 @@ func install() error {
 	wscript := filepath.Join(windir, "System32", "wscript.exe")
 	launcher := filepath.Join(dir, "Wallhaven-Rotator-Launcher.vbs")
 	runCmd := fmt.Sprintf(`"%s" //B //Nologo "%s" autostart`, wscript, launcher)
-	if err := setRunValue(runCmd); err != nil {
-		return fmt.Errorf("autostart: %w", err)
+	if enableAutostart {
+		if err := setRunValue(runCmd); err != nil {
+			return fmt.Errorf("autostart: %w", err)
+		}
+	} else {
+		deleteRunValue()
 	}
 
 	marker := installMarker{
@@ -505,18 +588,64 @@ func install() error {
 		return err
 	}
 
-	launchInstalledApp(dir)
+	if launchMode != "" {
+		launchInstalledApp(dir, launchMode)
+	}
 	return nil
 }
 
-func launchInstalledApp(dir string) {
+func install() error {
+	enableAutostart := true
+	if isInstalled() {
+		enableAutostart = runValueExists()
+	}
+	return installWithLaunch("show", enableAutostart)
+}
+
+func appendSetupLog(message string) {
+	dir := filepath.Join(appPath(), "logs")
+	_ = os.MkdirAll(dir, 0755)
+	f, err := os.OpenFile(filepath.Join(dir, "update-setup.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	_, _ = fmt.Fprintf(f, "%s %s\n", time.Now().Format(time.RFC3339), message)
+}
+
+func silentUpdate(enableAutostart bool) error {
+	appendSetupLog("silent update requested: target=" + appVersion)
+
+	deadline := time.Now().Add(20 * time.Second)
+	for isRunning() && time.Now().Before(deadline) {
+		time.Sleep(250 * time.Millisecond)
+	}
+	if isRunning() {
+		err := fmt.Errorf("Wallhaven Rotator did not exit within 20 seconds")
+		appendSetupLog("silent update failed: " + err.Error())
+		return err
+	}
+
+	if err := installWithLaunch("autostart", enableAutostart); err != nil {
+		appendSetupLog("silent update failed: " + err.Error())
+		return err
+	}
+
+	appendSetupLog("silent update completed: version=" + appVersion)
+	return nil
+}
+
+func launchInstalledApp(dir, mode string) {
 	windir := os.Getenv("WINDIR")
 	if windir == "" {
 		windir = `C:\Windows`
 	}
 	wscript := filepath.Join(windir, "System32", "wscript.exe")
 	launcher := filepath.Join(dir, "Wallhaven-Rotator-Launcher.vbs")
-	params := fmt.Sprintf(`//B //Nologo "%s" show`, launcher)
+	if mode == "" {
+		mode = "show"
+	}
+	params := fmt.Sprintf(`//B //Nologo "%s" %s`, launcher, mode)
 	procShellExecuteW.Call(
 		0,
 		uintptr(unsafe.Pointer(utf16Ptr("open"))),
@@ -914,6 +1043,18 @@ func runGUI() error {
 	return nil
 }
 
+func parseAutostartArg(args []string, fallback bool) bool {
+	for _, arg := range args {
+		switch strings.ToLower(strings.TrimSpace(arg)) {
+		case "--autostart=1", "/autostart=1":
+			return true
+		case "--autostart=0", "/autostart=0":
+			return false
+		}
+	}
+	return fallback
+}
+
 func main() {
 	args := os.Args[1:]
 	if len(args) > 0 {
@@ -927,6 +1068,12 @@ func main() {
 		case "/uninstall", "--uninstall":
 			if err := uninstall(); err != nil {
 				messageBox(err.Error(), appName+" Setup", MB_OK|MB_ICONERROR)
+				os.Exit(1)
+			}
+			os.Exit(0)
+		case "/silent-update", "--silent-update":
+			enableAutostart := parseAutostartArg(args[1:], runValueExists())
+			if err := silentUpdate(enableAutostart); err != nil {
 				os.Exit(1)
 			}
 			os.Exit(0)
