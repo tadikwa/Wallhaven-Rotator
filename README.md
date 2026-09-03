@@ -88,14 +88,6 @@ Free code signing provided by [SignPath.io](https://signpath.io/), certificate b
 
 See [CODE_SIGNING.md](CODE_SIGNING.md).
 
-## Roadmap
-
-The next planned public release is **1.1.0**. Work is tracked in:
-
-- [#1 — Display-aware resolution and aspect-ratio filtering](../../issues/1)
-- [#2 — Update notification and optional silent OTA updates](../../issues/2)
-
-No intermediate public release is planned while these items are being developed and tested.
 
 ## License
 
