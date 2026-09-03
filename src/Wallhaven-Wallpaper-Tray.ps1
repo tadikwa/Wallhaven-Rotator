@@ -1380,7 +1380,7 @@ $script:NextUpdateCheck = [DateTime]::Now.AddSeconds(5)
     Width="560"
     SizeToContent="Height"
     MinHeight="430"
-    MaxHeight="980"
+    MaxHeight="900"
     WindowStartupLocation="CenterScreen"
     WindowStyle="None"
     ResizeMode="NoResize"
@@ -1616,6 +1616,10 @@ $script:NextUpdateCheck = [DateTime]::Now.AddSeconds(5)
                           Header="Options"
                           Margin="0,15,0,0"
                           Foreground="#F4F7F5">
+                    <ScrollViewer x:Name="OptionsScrollViewer"
+                                  VerticalScrollBarVisibility="Auto"
+                                  HorizontalScrollBarVisibility="Disabled"
+                                  PanningMode="VerticalOnly">
                     <Border Background="{StaticResource Panel2}"
                             BorderBrush="{StaticResource Stroke}"
                             BorderThickness="1"
@@ -1752,6 +1756,7 @@ $script:NextUpdateCheck = [DateTime]::Now.AddSeconds(5)
                                     IsEnabled="False"/>
                         </StackPanel>
                     </Border>
+                    </ScrollViewer>
                 </Expander>
 
                 <Grid Margin="0,16,0,0">
@@ -1799,6 +1804,7 @@ $AutoRotationCheck = $window.FindName("AutoRotationCheck")
 $ChangeNowButton = $window.FindName("ChangeNowButton")
 $PauseButton = $window.FindName("PauseButton")
 $AdvancedExpander = $window.FindName("AdvancedExpander")
+$OptionsScrollViewer = $window.FindName("OptionsScrollViewer")
 $UpdateBanner = $window.FindName("UpdateBanner")
 $UpdateBannerTitle = $window.FindName("UpdateBannerTitle")
 $UpdateBannerText = $window.FindName("UpdateBannerText")
@@ -1845,6 +1851,36 @@ function Set-Status {
 
     $script:LastStatus = $Text
     $StatusText.Text = $Text
+}
+
+function Update-OptionsViewport {
+    try {
+        $workArea = [System.Windows.SystemParameters]::WorkArea
+
+        # Keep a small visible margin around the window and let only the
+        # variable Options content scroll when vertical room is limited.
+        $maxWindowHeight = [math]::Max(
+            460.0,
+            [double]$workArea.Height - 20.0
+        )
+
+        $window.MaxHeight = $maxWindowHeight
+
+        # Roughly 500 DIPs are occupied by the title bar, main controls,
+        # Options header, action buttons and footer. The remainder belongs
+        # to the scrollable Options body.
+        $optionsHeight = [math]::Max(
+            140.0,
+            $maxWindowHeight - 500.0
+        )
+
+        $OptionsScrollViewer.MaxHeight = $optionsHeight
+    }
+    catch {
+        # Conservative fallback for unusual display/DPI environments.
+        $window.MaxHeight = 900
+        $OptionsScrollViewer.MaxHeight = 380
+    }
 }
 
 function Refresh-ResolutionUi {
@@ -2010,6 +2046,7 @@ function Save-UiSettings {
 
 function Show-SettingsWindow {
     Sync-UiFromSettings
+    Update-OptionsViewport
     $window.ShowInTaskbar = $true
     $window.Show()
     $window.WindowState = [System.Windows.WindowState]::Normal
@@ -2020,6 +2057,10 @@ function Hide-SettingsWindow {
     $window.Hide()
     $window.ShowInTaskbar = $false
 }
+
+$AdvancedExpander.Add_Expanded({
+    Update-OptionsViewport
+})
 
 $ResolutionModeCombo.Add_SelectionChanged({
     Refresh-ResolutionUi
