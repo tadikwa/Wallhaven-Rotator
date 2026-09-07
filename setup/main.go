@@ -102,8 +102,8 @@ const (
 )
 
 var (
-	appVersion   = "1.1.0"
-	setupVersion = "1.1.0"
+	appVersion   = "1.2.0"
+	setupVersion = "1.2.0"
 )
 
 var (
@@ -257,6 +257,7 @@ type payloadItem struct {
 
 var payload = []payloadItem{
 	{"Wallhaven-Wallpaper-Tray.ps1"},
+	{"Wallhaven-SharedPolicy.ps1"},
 	{"Wallhaven-Rotator-Launcher.vbs"},
 	{"Wallhaven-Rotator.ico"},
 	{"Wallhaven-Rotator.png"},
@@ -366,6 +367,8 @@ func cleanOldSettings(path string) error {
 	defaults := map[string]interface{}{
 		"sort":               "Aléatoire",
 		"category":           "Toutes",
+		"query":              "",
+		"contentFilter":      "Reduced",
 		"value":              1,
 		"unit":               "Minutes",
 		"autoRotation":       true,

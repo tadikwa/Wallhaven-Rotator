@@ -6,7 +6,7 @@
 # Version épurée : rotation du wallpaper Wallhaven uniquement.
 
 $ErrorActionPreference = "Stop"
-$script:AppVersion = "1.1.0"
+$script:AppVersion = "1.2.0"
 
 Add-Type -AssemblyName PresentationFramework
 Add-Type -AssemblyName PresentationCore
@@ -15,6 +15,12 @@ Add-Type -AssemblyName System.Xaml
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Net.Http
+
+$SharedPolicyPath = Join-Path $PSScriptRoot "Wallhaven-SharedPolicy.ps1"
+if (-not (Test-Path $SharedPolicyPath)) {
+    throw "Module Wallhaven-SharedPolicy.ps1 introuvable."
+}
+. $SharedPolicyPath
 
 try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -40,19 +46,18 @@ $ApiBase = "https://wallhaven.cc/api/v1/search"
 $GitHubLatestReleaseApi = "https://api.github.com/repos/tadikwa/Wallhaven-Rotator/releases/latest"
 $GitHubReleasesUrl = "https://github.com/tadikwa/Wallhaven-Rotator/releases"
 $UpdateCheckInterval = [TimeSpan]::FromHours(6)
-$ExpectedUpdateSignerCn = "CN=SignPath Foundation"
-$ExpectedUpdateSignerOrg = "O=SignPath Foundation"
 $UpdateRetentionDays = 7
 $LogRetentionDays = 7
 $LogMaxBytes = 2097152
 
 # Anti-répétition / cache.
-# 1 000 IDs = plus de deux journées de 8 h à raison d'un changement/minute.
-$HistoryMaxIds = 1000
-$HistoryRecentFallbackIds = 200
+# L'historique global est partagé avec Wallhaven Screensaver et stocke les
+# 5 000 derniers IDs + timestamp. seenToday est une exclusion absolue.
+$HistoryMaxIds = 5000
 $CacheMaxFiles = 50
 $CacheMaxBytes = 524288000  # 500 MiB
 $ApiSelectionAttemptsPerMode = 4
+$MetadataChecksPerSelection = 16
 
 New-Item -ItemType Directory -Path $BaseDir -Force | Out-Null
 New-Item -ItemType Directory -Path $CacheDir -Force | Out-Null
@@ -196,11 +201,14 @@ $CustomRatioNames = @(
     "4:3", "5:4", "3:2", "1:1",
     "10:16", "9:16", "9:18"
 )
+$ContentFilterNames = @("Standard", "Reduced", "Strict")
 
 function Get-DefaultSettings {
     [pscustomobject]@{
         sort = "Aléatoire"
         category = "Toutes"
+        query = ""
+        contentFilter = "Reduced"
         value = 1
         unit = "Minutes"
         autoRotation = $true
@@ -235,6 +243,13 @@ function Load-Settings {
             [string]$old.category
         } else {
             $defaults.category
+        }
+
+        $query = if ($null -eq $old.query) { "" } else { [string]$old.query }
+        $contentFilter = if ([string]$old.contentFilter -in $ContentFilterNames) {
+            [string]$old.contentFilter
+        } else {
+            $defaults.contentFilter
         }
 
         $value = 0
@@ -292,6 +307,8 @@ function Load-Settings {
         return [pscustomobject]@{
             sort = $sort
             category = $category
+            query = $query
+            contentFilter = $contentFilter
             value = $value
             unit = $unit
             autoRotation = $auto
@@ -316,6 +333,8 @@ function Save-Settings {
         [ordered]@{
             sort = [string]$script:Settings.sort
             category = [string]$script:Settings.category
+            query = [string]$script:Settings.query
+            contentFilter = [string]$script:Settings.contentFilter
             value = [int]$script:Settings.value
             unit = [string]$script:Settings.unit
             autoRotation = [bool]$script:Settings.autoRotation
@@ -533,104 +552,55 @@ function Test-ResolutionFallbackAllowed {
     )
 }
 
+function Get-SharedHistoryOrderedIds {
+    $snapshot = Get-SharedHistorySnapshot
+    return @(
+        $snapshot.LastShown.GetEnumerator() |
+            Sort-Object Value |
+            ForEach-Object { [string]$_.Key }
+    )
+}
+
 function Load-WallpaperHistory {
     $list = New-Object 'System.Collections.Generic.List[string]'
-
-    if (-not (Test-Path $HistoryPath)) {
-        # Keep the generic List object intact. PowerShell otherwise enumerates
-        # collection output and an empty list becomes $null to the caller.
-        Write-Output -NoEnumerate $list
-        return
-    }
-
-    try {
-        $raw = Get-Content -Path $HistoryPath -Raw | ConvertFrom-Json
-        $ids = @()
-
-        if ($raw.PSObject.Properties["ids"]) {
-            $ids = @($raw.ids)
-        }
-        elseif ($raw -is [System.Array]) {
-            $ids = @($raw)
-        }
-
-        foreach ($id in $ids) {
-            $s = [string]$id
-            if (-not [string]::IsNullOrWhiteSpace($s)) {
-                $list.Add($s)
-            }
-        }
-
-        while ($list.Count -gt $HistoryMaxIds) {
-            $list.RemoveAt(0)
+    foreach ($id in @(Get-SharedHistoryOrderedIds)) {
+        if (-not [string]::IsNullOrWhiteSpace($id)) {
+            [void]$list.Add($id)
         }
     }
-    catch {
-        Write-Log "WARN" "Historique illisible ; nouveau fichier créé : $($_.Exception.Message)"
-        $list.Clear()
-    }
-
-    # Always return the List object itself, even when it contains 0 or 1 item.
     Write-Output -NoEnumerate $list
 }
 
-function Save-WallpaperHistory {
-    try {
-        $ids = @()
-        foreach ($id in $script:HistoryIds) {
-            $ids += [string]$id
-        }
+function Refresh-SharedHistoryView {
+    $script:SharedHistorySnapshot = Get-SharedHistorySnapshot
+    $list = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($entry in @(
+        $script:SharedHistorySnapshot.LastShown.GetEnumerator() |
+            Sort-Object Value
+    )) {
+        [void]$list.Add([string]$entry.Key)
+    }
+    $script:HistoryIds = $list
+}
 
-        [ordered]@{
-            version = 1
-            maxIds = $HistoryMaxIds
-            updatedAt = [DateTime]::Now.ToString("o")
-            ids = $ids
-        } |
-            ConvertTo-Json -Depth 3 |
-            Set-Content -Path $HistoryPath -Encoding UTF8
-    }
-    catch {
-        Write-Log "WARN" "Impossible d'enregistrer l'historique : $($_.Exception.Message)"
-    }
+function Save-WallpaperHistory {
+    # Compatibility shim. Shared history persists atomically on commit/release.
 }
 
 function Add-WallpaperToHistory {
     param([string]$Id)
-
-    if ([string]::IsNullOrWhiteSpace($Id)) {
-        return
+    if (-not [string]::IsNullOrWhiteSpace($Id)) {
+        Commit-SharedWallpaperShown -Id $Id
+        Refresh-SharedHistoryView
     }
-
-    # Defensive recovery for upgrades or a corrupted initialization state.
-    if ($null -eq $script:HistoryIds) {
-        $script:HistoryIds = New-Object 'System.Collections.Generic.List[string]'
-    }
-
-    while ($script:HistoryIds.Contains($Id)) {
-        [void]$script:HistoryIds.Remove($Id)
-    }
-
-    $script:HistoryIds.Add($Id)
-
-    while ($script:HistoryIds.Count -gt $HistoryMaxIds) {
-        $script:HistoryIds.RemoveAt(0)
-    }
-
-    Save-WallpaperHistory
 }
 
 function Get-HistoryTail {
     param([int]$Count)
-
-    $result = @()
-    $start = [math]::Max(0, $script:HistoryIds.Count - $Count)
-
-    for ($i = $start; $i -lt $script:HistoryIds.Count; $i++) {
-        $result += [string]$script:HistoryIds[$i]
-    }
-
-    return $result
+    $ordered = @(Get-SharedHistoryOrderedIds)
+    if ($Count -le 0 -or $ordered.Count -eq 0) { return @() }
+    $start = [math]::Max(0, $ordered.Count - $Count)
+    return @($ordered[$start..($ordered.Count - 1)])
 }
 
 function Get-SelectionPageLimit {
@@ -683,7 +653,10 @@ function Get-SelectionPage {
 }
 
 function Get-ApiUrl {
-    param([bool]$UseResolution)
+    param(
+        [bool]$UseResolution,
+        [bool]$UsePolicyQuery = $true
+    )
 
     $category = switch ([string]$script:Settings.category) {
         "Général"   { "100" }
@@ -715,6 +688,18 @@ function Get-ApiUrl {
         }
     }
 
+    $query = if ($UsePolicyQuery) {
+        Get-EffectiveWallhavenQuery `
+            -UserQuery ([string]$script:Settings.query) `
+            -Mode ([string]$script:Settings.contentFilter)
+    } else {
+        ([string]$script:Settings.query).Trim()
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($query)) {
+        $params["q"] = $query
+    }
+
     $target = Get-TargetDisplayFilter
     $resolutionParams = Get-ResolutionQueryParameters `
         -Target $target `
@@ -724,12 +709,15 @@ function Get-ApiUrl {
         $params[$key] = [string]$resolutionParams[$key]
     }
 
-    $script:ApiQueryKey = "{0}|{1}|{2}|{3}|{4}|{5}x{6}" -f `
+    $script:ApiQueryKey = "{0}|{1}|{2}|{3}|{4}|{5}|{6}|policy{7}|{8}x{9}" -f `
         [string]$script:Settings.sort,
         [string]$script:Settings.category,
+        [string]$script:Settings.query,
+        [string]$script:Settings.contentFilter,
         [string]$target.Ratio,
         [string]$target.MatchMode,
         [bool]$UseResolution,
+        $script:WallhavenContentFilterPolicyVersion,
         [int]$target.Width,
         [int]$target.Height
 
@@ -929,25 +917,9 @@ function Test-IsNewerVersion {
     }
 }
 
-function Get-SignedSetupAssetName {
+function Get-SetupAssetName {
     param([string]$Version)
     return "WallhavenRotator-Setup-v$Version.exe"
-}
-
-function Test-ExpectedUpdatePublisher {
-    param([string]$Subject)
-
-    if ([string]::IsNullOrWhiteSpace($Subject)) {
-        return $false
-    }
-
-    $cn = [regex]::Escape($ExpectedUpdateSignerCn)
-    $org = [regex]::Escape($ExpectedUpdateSignerOrg)
-
-    return (
-        $Subject -match "(^|,\s*)$cn(,|$)" -and
-        $Subject -match "(^|,\s*)$org(,|$)"
-    )
 }
 
 function Get-ExpectedHashFromChecksumText {
@@ -1005,13 +977,13 @@ function Update-UpdateUi {
         $UpdateBanner.Visibility = [System.Windows.Visibility]::Visible
         $UpdateBannerTitle.Text = "Mise à jour $($script:UpdateInfo.Version) disponible"
 
-        if ($script:UpdateInfo.SignedAssetAvailable) {
+        if ($script:UpdateInfo.SetupAssetAvailable) {
             if (-not $script:UpdateInfo.HashAvailable) {
-                $UpdateBannerText.Text = "Setup signé disponible, mais somme SHA-256 absente : installation automatique désactivée."
+                $UpdateBannerText.Text = "Setup disponible, mais somme SHA-256 absente : installation automatique désactivée."
                 $UpdateActionButton.Content = "Voir la release"
             }
             elseif ($script:UpdateReadyPath) {
-                $UpdateBannerText.Text = "Setup SignPath vérifié et prêt à installer."
+                $UpdateBannerText.Text = "Setup vérifié par SHA-256 et prêt à installer."
                 $UpdateActionButton.Content = "Installer"
             }
             elseif ($script:UpdateStage -in @("Hash", "Binary")) {
@@ -1019,12 +991,12 @@ function Update-UpdateUi {
                 $UpdateActionButton.Content = "Patientez…"
             }
             else {
-                $UpdateBannerText.Text = "Setup signé publié ; cliquez pour le télécharger puis vérifier SHA-256 et Authenticode."
+                $UpdateBannerText.Text = "Setup publié ; cliquez pour le télécharger et vérifier son SHA-256."
                 $UpdateActionButton.Content = "Mettre à jour"
             }
         }
         else {
-            $UpdateBannerText.Text = "La release existe, mais aucun setup signé n'est encore disponible."
+            $UpdateBannerText.Text = "La release existe, mais aucun setup compatible n'est disponible."
             $UpdateActionButton.Content = "Voir la release"
         }
     }
@@ -1039,11 +1011,11 @@ function Update-UpdateUi {
             $UpdateStateText.Text = "Vérification en cours…"
         }
         elseif ($null -ne $script:UpdateInfo -and (Test-IsNewerVersion -Candidate $script:UpdateInfo.Version)) {
-            $signedText = if (-not $script:UpdateInfo.SignedAssetAvailable) {
-                "signature en attente"
+            $updateAssetText = if (-not $script:UpdateInfo.SetupAssetAvailable) {
+                "setup indisponible"
             }
             elseif (-not $script:UpdateInfo.HashAvailable) {
-                "setup signé · checksum absent"
+                "setup · checksum absent"
             }
             elseif ($script:UpdateReadyPath) {
                 "setup vérifié"
@@ -1051,7 +1023,7 @@ function Update-UpdateUi {
             else {
                 "setup signé à vérifier"
             }
-            $UpdateStateText.Text = "Disponible : $($script:UpdateInfo.Version) · $signedText"
+            $UpdateStateText.Text = "Disponible : $($script:UpdateInfo.Version) · $updateAssetText"
         }
         else {
             $UpdateStateText.Text = "Version installée : $($script:AppVersion)"
@@ -1084,7 +1056,7 @@ function Start-UpdateCheck {
 }
 
 function Start-UpdateDownload {
-    if ($null -eq $script:UpdateInfo -or -not $script:UpdateInfo.SignedAssetAvailable) {
+    if ($null -eq $script:UpdateInfo -or -not $script:UpdateInfo.SetupAssetAvailable) {
         return
     }
 
@@ -1115,30 +1087,23 @@ function Test-DownloadedUpdate {
         [string]$ExpectedHash
     )
 
-    if (-not (Test-Path $Path)) {
-        return $false
-    }
-
     try {
+        if (
+            [string]::IsNullOrWhiteSpace($Path) -or
+            -not (Test-Path $Path) -or
+            [string]::IsNullOrWhiteSpace($ExpectedHash)
+        ) {
+            Write-Log "WARN" "Mise à jour rejetée : fichier ou SHA-256 attendu absent."
+            return $false
+        }
+
         $actual = (Get-FileHash -Path $Path -Algorithm SHA256).Hash.ToLowerInvariant()
         if ($actual -ne $ExpectedHash.ToLowerInvariant()) {
             Write-Log "ERROR" "Mise à jour rejetée : SHA-256 inattendu ($actual)."
             return $false
         }
 
-        $signature = Get-AuthenticodeSignature -FilePath $Path
-        if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
-            Write-Log "WARN" "Mise à jour automatique rejetée : signature Authenticode non valide ($($signature.Status))."
-            return $false
-        }
-
-        $subject = [string]$signature.SignerCertificate.Subject
-        if (-not (Test-ExpectedUpdatePublisher -Subject $subject)) {
-            Write-Log "ERROR" "Mise à jour rejetée : éditeur Authenticode inattendu ($subject)."
-            return $false
-        }
-
-        Write-Log "INFO" "Mise à jour vérifiée : SHA-256 + chaîne Authenticode valides ; éditeur=$subject ; issuer=$($signature.SignerCertificate.Issuer)"
+        Write-Log "INFO" "Mise à jour vérifiée par SHA-256 : $actual"
         return $true
     }
     catch {
@@ -1203,21 +1168,21 @@ function Process-UpdateState {
                     $script:UpdateExpectedHash = $null
                 }
 
-                $signedName = Get-SignedSetupAssetName -Version $version
-                $signedAsset = @($release.assets | Where-Object { [string]$_.name -eq $signedName } | Select-Object -First 1)
-                $hashAsset = @($release.assets | Where-Object { [string]$_.name -in @("SHA256-SIGNED.txt", "SHA256SUMS.txt") } | Sort-Object { if ([string]$_.name -eq "SHA256-SIGNED.txt") { 0 } else { 1 } } | Select-Object -First 1)
+                $setupName = Get-SetupAssetName -Version $version
+                $setupAsset = @($release.assets | Where-Object { [string]$_.name -eq $setupName } | Select-Object -First 1)
+                $hashAsset = @($release.assets | Where-Object { [string]$_.name -eq "SHA256SUMS.txt" } | Select-Object -First 1)
 
                 $script:UpdateInfo = [pscustomobject]@{
                     Version = $version
                     ReleaseUrl = [string]$release.html_url
-                    SignedAssetAvailable = ($signedAsset.Count -gt 0)
+                    SetupAssetAvailable = ($setupAsset.Count -gt 0)
                     HashAvailable = ($hashAsset.Count -gt 0)
-                    SetupUrl = if ($signedAsset.Count -gt 0) { [string]$signedAsset[0].browser_download_url } else { $null }
+                    SetupUrl = if ($setupAsset.Count -gt 0) { [string]$setupAsset[0].browser_download_url } else { $null }
                     HashUrl = if ($hashAsset.Count -gt 0) { [string]$hashAsset[0].browser_download_url } else { $null }
-                    SetupName = $signedName
+                    SetupName = $setupName
                 }
 
-                Write-Log "INFO" "Mise à jour détectée : $version ; signé=$($script:UpdateInfo.SignedAssetAvailable)"
+                Write-Log "INFO" "Mise à jour détectée : $version ; setup=$($script:UpdateInfo.SetupAssetAvailable) ; checksum=$($script:UpdateInfo.HashAvailable)"
                 Show-UpdateNotification -Version $version
             }
             else {
@@ -1238,7 +1203,7 @@ function Process-UpdateState {
 
         if (
             $script:UpdateInfo -and
-            $script:UpdateInfo.SignedAssetAvailable -and
+            $script:UpdateInfo.SetupAssetAvailable -and
             $script:UpdateInfo.HashAvailable -and
             [bool]$script:Settings.autoUpdate
         ) {
@@ -1354,7 +1319,20 @@ $script:NextChange = $null
 $script:State = "Idle"
 $script:ApiTask = $null
 $script:DownloadTask = $null
+$script:MetadataTask = $null
 $script:Candidate = $null
+$script:CandidateQueue = @()
+$script:ReservedCandidateId = $null
+$script:MetadataChecks = 0
+$script:AllowRecentHistoryRecycle = $false
+$script:ApiUsePolicyQuery = $true
+$script:CandidateDiagnostics = [ordered]@{
+    daily = 0
+    recent = 0
+    pending = 0
+    strict = 0
+    accepted = 0
+}
 $script:ApiUsedResolution = $true
 $script:ApiAttempt = 0
 $script:ApiCurrentPage = 1
@@ -1712,6 +1690,40 @@ $script:NextUpdateCheck = [DateTime]::Now.AddSeconds(5)
                                     Padding="10"
                                     Margin="0,9,0,0">
                                 <StackPanel>
+                                    <TextBlock Text="CONTENU WALLHAVEN"
+                                               Foreground="{StaticResource Accent}"
+                                               FontWeight="SemiBold"
+                                               FontSize="10"/>
+                                    <Grid Margin="0,8,0,0">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="10"/>
+                                            <ColumnDefinition Width="*"/>
+                                        </Grid.ColumnDefinitions>
+                                        <StackPanel Grid.Column="0">
+                                            <TextBlock Text="Filtrage" Foreground="{StaticResource Muted}" FontSize="10" Margin="0,0,0,4"/>
+                                            <ComboBox x:Name="ContentFilterCombo"/>
+                                        </StackPanel>
+                                        <StackPanel Grid.Column="2">
+                                            <TextBlock Text="Requête Wallhaven" Foreground="{StaticResource Muted}" FontSize="10" Margin="0,0,0,4"/>
+                                            <TextBox x:Name="QueryText"/>
+                                        </StackPanel>
+                                    </Grid>
+                                    <TextBlock Text="Strict est volontairement conservateur et utilise les tags/métadonnées Wallhaven ; il ne s'agit pas de reconnaissance d'image."
+                                               Foreground="{StaticResource Muted}"
+                                               FontSize="10"
+                                               TextWrapping="Wrap"
+                                               Margin="0,7,0,0"/>
+                                </StackPanel>
+                            </Border>
+
+                            <Border Background="#293238"
+                                    BorderBrush="{StaticResource Stroke}"
+                                    BorderThickness="1"
+                                    CornerRadius="8"
+                                    Padding="10"
+                                    Margin="0,9,0,0">
+                                <StackPanel>
                                     <TextBlock Text="MISES À JOUR"
                                                Foreground="{StaticResource Accent}"
                                                FontWeight="SemiBold"
@@ -1720,7 +1732,7 @@ $script:NextUpdateCheck = [DateTime]::Now.AddSeconds(5)
                                               Content="Vérifier automatiquement les nouvelles versions"
                                               Margin="0,8,0,0"/>
                                     <CheckBox x:Name="AutoUpdateCheck"
-                                              Content="Installer automatiquement les mises à jour signées"
+                                              Content="Installer automatiquement les mises à jour"
                                               Margin="0,6,0,0"/>
                                     <TextBlock x:Name="UpdateStateText"
                                                Text="Version installée"
@@ -1733,7 +1745,8 @@ $script:NextUpdateCheck = [DateTime]::Now.AddSeconds(5)
                                 </StackPanel>
                             </Border>
 
-                            <TextBlock Text="Anti-répétition : 1 000 fonds mémorisés entre les redémarrages · sélection étendue sur plusieurs pages Wallhaven."
+                            <TextBlock x:Name="AntiRepeatStatsText"
+                                       Text="Anti-répétition : initialisation…"
                                        Foreground="{StaticResource Muted}"
                                        FontSize="10.5"
                                        TextWrapping="Wrap"
@@ -1827,6 +1840,9 @@ $CustomWidthText = $window.FindName("CustomWidthText")
 $CustomHeightText = $window.FindName("CustomHeightText")
 $CustomRatioCombo = $window.FindName("CustomRatioCombo")
 $ResolutionInfoText = $window.FindName("ResolutionInfoText")
+$ContentFilterCombo = $window.FindName("ContentFilterCombo")
+$QueryText = $window.FindName("QueryText")
+$AntiRepeatStatsText = $window.FindName("AntiRepeatStatsText")
 $CheckUpdatesCheck = $window.FindName("CheckUpdatesCheck")
 $AutoUpdateCheck = $window.FindName("AutoUpdateCheck")
 $UpdateStateText = $window.FindName("UpdateStateText")
@@ -1855,6 +1871,9 @@ foreach ($item in $ResolutionMatchNames) {
 }
 foreach ($item in $CustomRatioNames) {
     [void]$CustomRatioCombo.Items.Add($item)
+}
+foreach ($item in $ContentFilterNames) {
+    [void]$ContentFilterCombo.Items.Add($item)
 }
 
 function Set-Status {
@@ -1940,6 +1959,8 @@ function Refresh-ResolutionUi {
 function Sync-UiFromSettings {
     $SortCombo.SelectedItem = [string]$script:Settings.sort
     $CategoryCombo.SelectedItem = [string]$script:Settings.category
+    $QueryText.Text = [string]$script:Settings.query
+    $ContentFilterCombo.SelectedItem = [string]$script:Settings.contentFilter
     $IntervalText.Text = [string][int]$script:Settings.value
     $UnitCombo.SelectedItem = [string]$script:Settings.unit
     $AutoRotationCheck.IsChecked = [bool]$script:Settings.autoRotation
@@ -1980,6 +2001,7 @@ function Save-UiSettings {
     if (
         $null -eq $SortCombo.SelectedItem -or
         $null -eq $CategoryCombo.SelectedItem -or
+        $null -eq $ContentFilterCombo.SelectedItem -or
         $null -eq $UnitCombo.SelectedItem -or
         $null -eq $ResolutionModeCombo.SelectedItem -or
         $null -eq $ResolutionMatchCombo.SelectedItem -or
@@ -2015,6 +2037,8 @@ function Save-UiSettings {
 
     $script:Settings.sort = [string]$SortCombo.SelectedItem
     $script:Settings.category = [string]$CategoryCombo.SelectedItem
+    $script:Settings.query = [string]$QueryText.Text
+    $script:Settings.contentFilter = [string]$ContentFilterCombo.SelectedItem
     $script:Settings.value = $value
     $script:Settings.unit = [string]$UnitCombo.SelectedItem
     $script:Settings.autoRotation = [bool]$AutoRotationCheck.IsChecked
@@ -2055,8 +2079,34 @@ function Save-UiSettings {
     return $true
 }
 
+function Refresh-DiagnosticsUi {
+    try {
+        $snapshot = Get-SharedHistorySnapshot
+        $cacheCount = @(
+            Get-ChildItem -Path $CacheDir -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -like "wallhaven-*" }
+        ).Count
+
+        $AntiRepeatStatsText.Text = (
+            "Anti-répétition globale : aujourd'hui={0} · historique={1}/{2} · cache={3} · rejets jour={4} · récents={5} · pending={6} · Strict={7}" -f
+            $snapshot.SeenTodayCount,
+            $snapshot.HistoryCount,
+            $HistoryMaxIds,
+            $cacheCount,
+            [int]$script:CandidateDiagnostics.daily,
+            [int]$script:CandidateDiagnostics.recent,
+            [int]$script:CandidateDiagnostics.pending,
+            [int]$script:CandidateDiagnostics.strict
+        )
+    }
+    catch {
+        $AntiRepeatStatsText.Text = "Anti-répétition globale : diagnostic indisponible."
+    }
+}
+
 function Show-SettingsWindow {
     Sync-UiFromSettings
+    Refresh-DiagnosticsUi
     Update-OptionsViewport
     $window.ShowInTaskbar = $true
     $window.Show()
@@ -2106,7 +2156,7 @@ $UpdateActionButton.Add_Click({
     }
     elseif (
         $script:UpdateInfo -and
-        $script:UpdateInfo.SignedAssetAvailable -and
+        $script:UpdateInfo.SetupAssetAvailable -and
         $script:UpdateInfo.HashAvailable
     ) {
         Start-UpdateDownload
@@ -2212,12 +2262,34 @@ else {
 
 $notifyIcon.Visible = $true
 
+﻿function Write-CandidateDiagnostic {
+    param(
+        [ValidateSet("daily", "recent", "pending", "strict", "accepted")]
+        [string]$Kind,
+        [string]$Id,
+        [string]$Detail = ""
+    )
+
+    $script:CandidateDiagnostics[$Kind] = [int]$script:CandidateDiagnostics[$Kind] + 1
+    $event = switch ($Kind) {
+        "daily"   { "candidate_rejected_daily_repeat" }
+        "recent"  { "candidate_rejected_recent_history" }
+        "pending" { "candidate_rejected_pending_duplicate" }
+        "strict"  { "candidate_rejected_strict_filter" }
+        default   { "candidate_accepted" }
+    }
+    Write-Log "DEBUG" "$event id=$Id $Detail"
+}
+
 function Start-ApiRequest {
     param([bool]$UseResolution)
 
     try {
         $script:ApiAttempt++
-        $url = Get-ApiUrl -UseResolution $UseResolution
+        $url = Get-ApiUrl `
+            -UseResolution $UseResolution `
+            -UsePolicyQuery ([bool]$script:ApiUsePolicyQuery)
+
         $script:ApiUsedResolution = $UseResolution
         $script:State = "Api"
         $script:ApiTask = $script:HttpClient.GetStringAsync($url)
@@ -2230,19 +2302,105 @@ function Start-ApiRequest {
         }
 
         $target = Get-TargetDisplayFilter
-        Write-Log "INFO" "API GET $url ; tentative=$($script:ApiAttempt) ; historique=$($script:HistoryIds.Count)/$HistoryMaxIds ; cible=$($target.Width)x$($target.Height) ratio=$($target.Ratio) mode=$($target.Source) match=$($target.MatchMode)"
+        Write-Log "INFO" (
+            "API GET $url ; tentative=$($script:ApiAttempt) ; cible=$($target.Width)x$($target.Height) " +
+            "ratio=$($target.Ratio) filtre=$($script:Settings.contentFilter) recycle=$($script:AllowRecentHistoryRecycle)"
+        )
     }
     catch {
         Handle-RequestFailure -Message (Get-DeepErrorMessage $_)
     }
 }
 
+function Get-EligibleCandidates {
+    param([object[]]$Data)
+
+    $snapshot = Get-SharedHistorySnapshot
+    $seenLocal = @{}
+    $accepted = New-Object System.Collections.Generic.List[object]
+
+    foreach ($item in @($Data)) {
+        $id = [string]$item.id
+        if (-not $id -or $seenLocal.ContainsKey($id)) {
+            if ($id) { Write-CandidateDiagnostic -Kind pending -Id $id -Detail "source=local_page" }
+            continue
+        }
+        $seenLocal[$id] = $true
+
+        if ($snapshot.SeenToday.Contains($id)) {
+            Write-CandidateDiagnostic -Kind daily -Id $id
+            continue
+        }
+
+        if ($snapshot.Pending.Contains($id)) {
+            Write-CandidateDiagnostic -Kind pending -Id $id -Detail "source=shared"
+            continue
+        }
+
+        if (-not $script:AllowRecentHistoryRecycle -and $snapshot.History.Contains($id)) {
+            Write-CandidateDiagnostic -Kind recent -Id $id
+            continue
+        }
+
+        [void]$accepted.Add($item)
+    }
+
+    if ($script:AllowRecentHistoryRecycle) {
+        return @(
+            $accepted |
+                Sort-Object {
+                    $id = [string]$_.id
+                    if ($snapshot.LastShown.ContainsKey($id)) {
+                        [DateTimeOffset]$snapshot.LastShown[$id]
+                    }
+                    else {
+                        [DateTimeOffset]::MinValue
+                    }
+                }
+        )
+    }
+
+    return @($accepted | Sort-Object { Get-Random })
+}
+
+function Finish-NoEligibleCandidate {
+    param([string]$Reason)
+
+    if ($script:ReservedCandidateId) {
+        Release-SharedWallpaperReservation -Id $script:ReservedCandidateId
+        $script:ReservedCandidateId = $null
+    }
+
+    $script:State = "Idle"
+    $script:ApiTask = $null
+    $script:MetadataTask = $null
+    $script:DownloadTask = $null
+    $script:Candidate = $null
+    $script:CandidateQueue = @()
+
+    Set-Status "Aucun nouveau fond éligible pour le moment · image actuelle conservée."
+    Write-Log "WARN" "Sélection sans candidat : $Reason"
+
+    if ($script:Running) {
+        Schedule-NextChange
+    }
+
+    Refresh-DiagnosticsUi
+}
+
 function Retry-ApiSelection {
     param([string]$Reason)
+
+    if ($script:ReservedCandidateId) {
+        Release-SharedWallpaperReservation -Id $script:ReservedCandidateId
+        $script:ReservedCandidateId = $null
+    }
 
     if ($script:ApiAttempt -lt $ApiSelectionAttemptsPerMode) {
         Write-Log "DEBUG" "Nouvel essai de sélection : $Reason"
         $script:ApiTask = $null
+        $script:MetadataTask = $null
+        $script:CandidateQueue = @()
         $script:State = "Idle"
         Start-ApiRequest -UseResolution ([bool]$script:ApiUsedResolution)
         return $true
@@ -2250,20 +2408,111 @@ function Retry-ApiSelection {
 
     $target = Get-TargetDisplayFilter
     if (Test-ResolutionFallbackAllowed -Target $target -UseResolution ([bool]$script:ApiUsedResolution)) {
-        Write-Log "INFO" "Sélection difficile avec résolution minimale ; nouvel essai sans minimum mais en conservant le ratio $($target.Ratio)."
+        Write-Log "INFO" "Nouvel essai sans résolution minimale, ratio conservé=$($target.Ratio)."
         $script:ApiAttempt = 0
         $script:PagesTried = @()
         $script:ApiTask = $null
+        $script:MetadataTask = $null
+        $script:CandidateQueue = @()
         $script:State = "Idle"
         Start-ApiRequest -UseResolution $false
         return $true
     }
 
-    if ([bool]$target.IsExact) {
-        Write-Log "INFO" "Mode résolution exacte : aucun élargissement automatique du filtre."
+    if (-not $script:AllowRecentHistoryRecycle) {
+        $script:AllowRecentHistoryRecycle = $true
+        $script:ApiAttempt = 0
+        $script:PagesTried = @()
+        $script:ApiTask = $null
+        $script:MetadataTask = $null
+        $script:CandidateQueue = @()
+        $script:State = "Idle"
+        Write-Log "INFO" "Pool inédit épuisé ; recyclage long-terme oldest-first, seenToday toujours interdit."
+        Start-ApiRequest -UseResolution ([bool]$script:ApiUsedResolution)
+        return $true
     }
 
+    Finish-NoEligibleCandidate -Reason $Reason
     return $false
+}
+
+function Begin-CandidateDownload {
+    $candidate = $script:Candidate
+    if ($null -eq $candidate) {
+        Retry-ApiSelection -Reason "candidat absent" | Out-Null
+        return
+    }
+
+    $imageUri = [Uri]::new([string]$candidate.path)
+    $ext = [IO.Path]::GetExtension($imageUri.AbsolutePath).ToLowerInvariant()
+    if ($ext -notin @(".jpg", ".jpeg", ".png")) {
+        if ([string]$candidate.file_type -eq "image/png") { $ext = ".png" } else { $ext = ".jpg" }
+    }
+
+    $filePath = Join-Path $CacheDir ("wallhaven-{0}{1}" -f $candidate.id, $ext)
+    $script:Candidate | Add-Member -NotePropertyName LocalFilePath -NotePropertyValue $filePath -Force
+
+    if (Test-Path $filePath) {
+        try { (Get-Item $filePath).LastWriteTime = [DateTime]::Now } catch {}
+        Write-Log "INFO" "CACHE HIT $($candidate.id) -> $filePath"
+        $script:State = "Idle"
+        Complete-Wallpaper -FilePath $filePath -Candidate $candidate
+        return
+    }
+
+    Set-Status "Téléchargement de $($candidate.resolution)..."
+    Write-Log "INFO" "CACHE MISS $($candidate.id) ; IMAGE GET $($candidate.path)"
+    $script:DownloadTask = $script:HttpClient.GetByteArrayAsync([string]$candidate.path)
+    $script:State = "Download"
+}
+
+function Begin-CandidateEvaluation {
+    while (@($script:CandidateQueue).Count -gt 0) {
+        $candidate = $script:CandidateQueue[0]
+        if ($script:CandidateQueue.Count -gt 1) {
+            $script:CandidateQueue = @($script:CandidateQueue[1..($script:CandidateQueue.Count - 1)])
+        }
+        else {
+            $script:CandidateQueue = @()
+        }
+
+        $id = [string]$candidate.id
+        $reservation = Reserve-SharedWallpaper -Id $id
+        if (-not $reservation.Reserved) {
+            if ($reservation.Reason -eq "daily_repeat") {
+                Write-CandidateDiagnostic -Kind daily -Id $id -Detail "source=reserve"
+            }
+            else {
+                Write-CandidateDiagnostic -Kind pending -Id $id -Detail "source=reserve"
+            }
+            continue
+        }
+
+        $script:Candidate = $candidate
+        $script:ReservedCandidateId = $id
+
+        if (-not (Test-ContentFilterRequiresMetadata -Mode ([string]$script:Settings.contentFilter))) {
+            Begin-CandidateDownload
+            return
+        }
+
+        if ($script:MetadataChecks -ge $MetadataChecksPerSelection) {
+            Release-SharedWallpaperReservation -Id $id
+            $script:ReservedCandidateId = $null
+            Write-CandidateDiagnostic -Kind strict -Id $id -Detail "reason=metadata_limit"
+            continue
+        }
+
+        $script:MetadataChecks++
+        $metadataUrl = "https://wallhaven.cc/api/v1/w/$id"
+        Set-Status "Vérification des métadonnées Wallhaven..."
+        Write-Log "DEBUG" "METADATA GET $metadataUrl"
+        $script:MetadataTask = $script:HttpClient.GetStringAsync($metadataUrl)
+        $script:State = "Metadata"
+        return
+    }
+
+    Retry-ApiSelection -Reason "aucun candidat éligible dans la page" | Out-Null
 }
 
 function Start-WallpaperChange {
@@ -2282,14 +2531,26 @@ function Start-WallpaperChange {
 
     $script:ApiAttempt = 0
     $script:PagesTried = @()
+    $script:MetadataChecks = 0
+    $script:AllowRecentHistoryRecycle = $false
+    $script:ApiUsePolicyQuery = $true
+    $script:CandidateQueue = @()
+    $script:Candidate = $null
+    $script:ReservedCandidateId = $null
     Start-ApiRequest -UseResolution $true
 }
 
 function Handle-RequestFailure {
     param([string]$Message)
 
+    if ($script:ReservedCandidateId) {
+        Release-SharedWallpaperReservation -Id $script:ReservedCandidateId
+        $script:ReservedCandidateId = $null
+    }
+
     $script:State = "Idle"
     $script:ApiTask = $null
+    $script:MetadataTask = $null
     $script:DownloadTask = $null
     $script:Candidate = $null
 
@@ -2301,7 +2562,6 @@ function Handle-RequestFailure {
     Write-Log "ERROR" $Message
 
     if ($script:Running) {
-        # Au logon, le proxy / réseau d'entreprise peut ne pas être prêt.
         $script:NextChange = [DateTime]::Now.AddMinutes(1)
     }
 
@@ -2317,11 +2577,14 @@ function Complete-Wallpaper {
         $Candidate
     )
 
+    $id = [string]$Candidate.id
     try {
         Set-WindowsWallpaper -Path $FilePath
 
-        $id = [string]$Candidate.id
-        Add-WallpaperToHistory -Id $id
+        Commit-SharedWallpaperShown -Id $id
+        $script:ReservedCandidateId = $null
+        Refresh-SharedHistoryView
+        Write-CandidateDiagnostic -Kind accepted -Id $id
 
         $script:LastWallpaperId = $id
         if ($Candidate.url) {
@@ -2333,8 +2596,8 @@ function Complete-Wallpaper {
 
         $resolution = [string]$Candidate.resolution
         $category = [string]$Candidate.category
-
         $script:LastWallpaperFilePath = $FilePath
+
         Set-Status "Fond changé · $resolution · $category · $id"
         Write-Log "INFO" "Fond appliqué : $id $resolution $category"
 
@@ -2343,19 +2606,20 @@ function Complete-Wallpaper {
         $script:State = "Idle"
         $script:Candidate = $null
         $script:DownloadTask = $null
+        $script:MetadataTask = $null
         $script:ApiTask = $null
 
-        if ($script:Running) {
-            Schedule-NextChange
-        }
-        else {
-            $script:NextChange = $null
-        }
+        if ($script:Running) { Schedule-NextChange } else { $script:NextChange = $null }
 
         $menuCurrent.Enabled = $true
         $CurrentWallpaperButton.IsEnabled = $true
+        Refresh-DiagnosticsUi
     }
     catch {
+        if ($script:ReservedCandidateId) {
+            Release-SharedWallpaperReservation -Id $script:ReservedCandidateId
+            $script:ReservedCandidateId = $null
+        }
         Handle-RequestFailure -Message (Get-DeepErrorMessage $_)
         return
     }
@@ -2374,7 +2638,6 @@ function Process-AsyncState {
     ) {
         try {
             $json = $script:ApiTask.GetAwaiter().GetResult()
-
             if ([string]::IsNullOrWhiteSpace($json)) {
                 throw "Wallhaven a renvoyé une réponse vide."
             }
@@ -2390,95 +2653,91 @@ function Process-AsyncState {
             } catch {}
 
             if ($data.Count -eq 0) {
-                if (Retry-ApiSelection -Reason "page vide") {
+                $filtered = Get-EffectiveWallhavenQuery `
+                    -UserQuery ([string]$script:Settings.query) `
+                    -Mode ([string]$script:Settings.contentFilter)
+
+                if (
+                    [string]$script:Settings.contentFilter -ne "Standard" -and
+                    $script:ApiUsePolicyQuery -and
+                    $filtered -ne ([string]$script:Settings.query).Trim()
+                ) {
+                    $script:ApiUsePolicyQuery = $false
+                    $script:ApiTask = $null
+                    $script:State = "Idle"
+                    Write-Log "WARN" "Recherche filtrée vide ; nouvel essai avec requête utilisateur seule, filtre local conservé."
+                    Start-ApiRequest -UseResolution ([bool]$script:ApiUsedResolution)
                     return
                 }
 
-                throw "Wallhaven n'a trouvé aucun fond correspondant après plusieurs pages."
-            }
-
-            $available = @(
-                $data |
-                    Where-Object {
-                        $script:HistoryIds -notcontains [string]$_.id
-                    }
-            )
-
-            if ($available.Count -eq 0) {
-                if (Retry-ApiSelection -Reason "page entièrement présente dans l'historique") {
-                    return
-                }
-
-                # Si le pool choisi est réellement épuisé, on n'autorise qu'un
-                # fond qui n'a pas été vu dans les 200 derniers changements.
-                $recentGuard = @(Get-HistoryTail -Count $HistoryRecentFallbackIds)
-                $available = @(
-                    $data |
-                        Where-Object {
-                            $recentGuard -notcontains [string]$_.id
-                        }
-                )
-
-                if ($available.Count -eq 0) {
-                    $available = $data
-                }
-
-                Write-Log "WARN" "Pool inédit épuisé après plusieurs pages ; répétition ancienne autorisée (garde récente=$HistoryRecentFallbackIds)."
-            }
-
-            $candidate = Get-Random -InputObject $available
-            $script:Candidate = $candidate
-
-            $imageUri = [Uri]::new([string]$candidate.path)
-            $ext = [IO.Path]::GetExtension($imageUri.AbsolutePath).ToLowerInvariant()
-
-            if ($ext -notin @(".jpg", ".jpeg", ".png")) {
-                if ([string]$candidate.file_type -eq "image/png") {
-                    $ext = ".png"
-                }
-                else {
-                    $ext = ".jpg"
-                }
-            }
-
-            $filePath = Join-Path $CacheDir (
-                "wallhaven-{0}{1}" -f $candidate.id, $ext
-            )
-
-            $script:Candidate |
-                Add-Member `
-                    -NotePropertyName LocalFilePath `
-                    -NotePropertyValue $filePath `
-                    -Force
-
-            if (Test-Path $filePath) {
-                try {
-                    (Get-Item $filePath).LastWriteTime = [DateTime]::Now
-                } catch {}
-
-                Write-Log "INFO" "CACHE HIT $($candidate.id) -> $filePath"
-                $script:State = "Idle"
-                $script:ApiTask = $null
-                Complete-Wallpaper `
-                    -FilePath $filePath `
-                    -Candidate $candidate
+                Retry-ApiSelection -Reason "page vide" | Out-Null
                 return
             }
 
-            Set-Status "Téléchargement de $($candidate.resolution)..."
-            Write-Log "INFO" "CACHE MISS $($candidate.id) ; IMAGE GET $($candidate.path)"
-
-            $script:DownloadTask = $script:HttpClient.GetByteArrayAsync(
-                [string]$candidate.path
-            )
-
+            $script:CandidateQueue = @(Get-EligibleCandidates -Data $data)
             $script:ApiTask = $null
-            $script:State = "Download"
+            $script:State = "Idle"
+
+            if ($script:CandidateQueue.Count -eq 0) {
+                Retry-ApiSelection -Reason "page sans candidat inédit/éligible" | Out-Null
+                return
+            }
+
+            Begin-CandidateEvaluation
         }
         catch {
             Handle-RequestFailure -Message (Get-DeepErrorMessage $_)
         }
+        return
+    }
 
+    if (
+        $script:State -eq "Metadata" -and
+        $null -ne $script:MetadataTask -and
+        $script:MetadataTask.IsCompleted
+    ) {
+        $id = [string]$script:Candidate.id
+        try {
+            $metadataJson = $script:MetadataTask.GetAwaiter().GetResult()
+            $detail = $metadataJson | ConvertFrom-Json
+            $tags = @(
+                @($detail.data.tags) |
+                    ForEach-Object { [string]$_.name } |
+                    Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+            )
+
+            $decision = Get-ContentFilterDecision `
+                -WallhavenCategory ([string]$detail.data.category) `
+                -Tags $tags `
+                -Mode ([string]$script:Settings.contentFilter)
+
+            Write-Log "DEBUG" (
+                "content.metadata_checked id=$id category=$($decision.Category) mode=$($script:Settings.contentFilter) " +
+                "tags=$($tags.Count) score=$($decision.Score) accepted=$($decision.Allowed) " +
+                "reasons=$($decision.Reasons -join '|')"
+            )
+
+            $script:MetadataTask = $null
+            $script:State = "Idle"
+
+            if (-not $decision.Allowed) {
+                Release-SharedWallpaperReservation -Id $id
+                $script:ReservedCandidateId = $null
+                Write-CandidateDiagnostic -Kind strict -Id $id -Detail ("reasons=" + ($decision.Reasons -join "|"))
+                Begin-CandidateEvaluation
+                return
+            }
+
+            Begin-CandidateDownload
+        }
+        catch {
+            Release-SharedWallpaperReservation -Id $id
+            $script:ReservedCandidateId = $null
+            $script:MetadataTask = $null
+            $script:State = "Idle"
+            Write-CandidateDiagnostic -Kind strict -Id $id -Detail ("reason=metadata_failure " + (Get-DeepErrorMessage $_))
+            Begin-CandidateEvaluation
+        }
         return
     }
 
@@ -2489,38 +2748,26 @@ function Process-AsyncState {
     ) {
         try {
             [byte[]]$bytes = $script:DownloadTask.GetAwaiter().GetResult()
-
             if ($bytes.Length -lt 10240) {
                 throw "Le fichier reçu est anormalement petit ($($bytes.Length) octets)."
             }
-
             if (-not (Test-ImageBytes -Bytes $bytes)) {
                 throw "Le serveur n'a pas renvoyé une image JPEG/PNG valide."
             }
 
             $filePath = [string]$script:Candidate.LocalFilePath
             $tempPath = "$filePath.download"
-
             [IO.File]::WriteAllBytes($tempPath, $bytes)
             Move-Item -Path $tempPath -Destination $filePath -Force
 
             $script:DownloadTask = $null
             $script:State = "Idle"
-
-            Complete-Wallpaper `
-                -FilePath $filePath `
-                -Candidate $script:Candidate
+            Complete-Wallpaper -FilePath $filePath -Candidate $script:Candidate
         }
         catch {
             try {
-                if (
-                    $script:Candidate -and
-                    $script:Candidate.LocalFilePath
-                ) {
-                    Remove-Item `
-                        "$($script:Candidate.LocalFilePath).download" `
-                        -Force `
-                        -ErrorAction SilentlyContinue
+                if ($script:Candidate -and $script:Candidate.LocalFilePath) {
+                    Remove-Item "$($script:Candidate.LocalFilePath).download" -Force -ErrorAction SilentlyContinue
                 }
             } catch {}
 

@@ -27,6 +27,7 @@ New-Item -ItemType Directory -Path $Dist -Force | Out-Null
 
 # Refresh the embedded payload from the canonical application sources.
 Copy-Item (Join-Path $Root "src\Wallhaven-Wallpaper-Tray.ps1") (Join-Path $Payload "Wallhaven-Wallpaper-Tray.ps1") -Force
+Copy-Item (Join-Path $Root "src\Wallhaven-SharedPolicy.ps1") (Join-Path $Payload "Wallhaven-SharedPolicy.ps1") -Force
 Copy-Item (Join-Path $Root "src\Wallhaven-Rotator-Launcher.vbs") (Join-Path $Payload "Wallhaven-Rotator-Launcher.vbs") -Force
 Copy-Item (Join-Path $Root "src\README-runtime.txt") (Join-Path $Payload "README.txt") -Force
 Copy-Item (Join-Path $Root "assets\Wallhaven-Rotator.ico") (Join-Path $Payload "Wallhaven-Rotator.ico") -Force
