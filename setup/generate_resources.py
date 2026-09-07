@@ -74,7 +74,7 @@ fixed = struct.pack('<13I',
     0x3F, 0,
     0x00040004, 1, 0, 0, 0)
 version = block('VS_VERSION_INFO', fixed, len(fixed), 0, [string_info, var_info])
-manifest = MANIFEST.read_bytes()
+manifest = MANIFEST.read_bytes().replace(b'\r\n', b'\n').replace(b'\r', b'\n')
 
 group = bytearray(struct.pack('<HHH', 0, 1, len(icons)))
 for ic in icons:
