@@ -9,6 +9,26 @@ $Setup = Join-Path $Root "setup"
 $Payload = Join-Path $Setup "payload"
 $Dist = Join-Path $Root "dist"
 
+# Runtime encoding preflight: PowerShell 5.1 requires a single UTF-8 BOM at byte 0.
+$RuntimePath = Join-Path $Root "src\Wallhaven-Wallpaper-Tray.ps1"
+[byte[]]$RuntimeBytes = [System.IO.File]::ReadAllBytes($RuntimePath)
+$RuntimeBomPositions = New-Object 'System.Collections.Generic.List[int]'
+for ($i = 0; $i -le $RuntimeBytes.Length - 3; $i++) {
+    if (
+        $RuntimeBytes[$i]   -eq 0xEF -and
+        $RuntimeBytes[$i+1] -eq 0xBB -and
+        $RuntimeBytes[$i+2] -eq 0xBF
+    ) {
+        [void]$RuntimeBomPositions.Add($i)
+    }
+}
+if (
+    $RuntimeBomPositions.Count -ne 1 -or
+    $RuntimeBomPositions[0] -ne 0
+) {
+    throw "Encodage runtime invalide : un seul BOM UTF-8 est autorisé, à la position 0. Positions détectées : $($RuntimeBomPositions -join ', ')"
+}
+
 $CanonicalVersion = (Get-Content (Join-Path $Root "VERSION") -Raw).Trim()
 if ([string]::IsNullOrWhiteSpace($Version)) {
     $Version = $CanonicalVersion

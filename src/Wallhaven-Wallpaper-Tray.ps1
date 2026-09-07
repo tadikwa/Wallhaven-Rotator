@@ -2262,7 +2262,7 @@ else {
 
 $notifyIcon.Visible = $true
 
-﻿function Write-CandidateDiagnostic {
+function Write-CandidateDiagnostic {
     param(
         [ValidateSet("daily", "recent", "pending", "strict", "accepted")]
         [string]$Kind,
