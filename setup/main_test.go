@@ -25,7 +25,7 @@ func TestParseAutostartArg(t *testing.T) {
 	}
 }
 
-func TestSettingsMigrationPreservesLegacyValuesAndAdds110Defaults(t *testing.T) {
+func TestSettingsMigrationPreservesLegacyValuesAndAdds120Defaults(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "settings.json")
 
@@ -78,13 +78,16 @@ func TestSettingsMigrationPreservesLegacyValuesAndAdds110Defaults(t *testing.T) 
 	if out["checkUpdates"] != true || out["autoUpdate"] != false || out["lastNotifiedUpdate"] != "" {
 		t.Fatalf("1.1.0 update defaults were not added: %+v", out)
 	}
+	if out["query"] != "" || out["contentFilter"] != "Reduced" {
+		t.Fatalf("1.2.0 content-filter defaults were not added: %+v", out)
+	}
 }
 
 func TestSettingsMigrationLeavesCompleteFileUntouched(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "settings.json")
 
-	original := []byte("\xef\xbb\xbf{\r\n  \"sort\": \"Nouveaux\",\r\n  \"category\": \"GÃ©nÃ©ral\",\r\n  \"value\": 4,\r\n  \"unit\": \"Minutes\",\r\n  \"autoRotation\": true,\r\n  \"resolutionMode\": \"PersonnalisÃ©\",\r\n  \"resolutionMatch\": \"Exacte\",\r\n  \"customWidth\": 3440,\r\n  \"customHeight\": 1440,\r\n  \"customRatio\": \"21:9\",\r\n  \"checkUpdates\": true,\r\n  \"autoUpdate\": true,\r\n  \"lastNotifiedUpdate\": \"1.1.0\",\r\n  \"futureSetting\": \"keep-me\"\r\n}\r\n")
+	original := []byte("\xef\xbb\xbf{\r\n  \"sort\": \"Nouveaux\",\r\n  \"category\": \"GÃ©nÃ©ral\",\r\n  \"query\": \"\",\r\n  \"contentFilter\": \"Reduced\",\r\n  \"value\": 4,\r\n  \"unit\": \"Minutes\",\r\n  \"autoRotation\": true,\r\n  \"resolutionMode\": \"PersonnalisÃ©\",\r\n  \"resolutionMatch\": \"Exacte\",\r\n  \"customWidth\": 3440,\r\n  \"customHeight\": 1440,\r\n  \"customRatio\": \"21:9\",\r\n  \"checkUpdates\": true,\r\n  \"autoUpdate\": true,\r\n  \"lastNotifiedUpdate\": \"1.1.0\",\r\n  \"futureSetting\": \"keep-me\"\r\n}\r\n")
 
 	if err := os.WriteFile(path, original, 0644); err != nil {
 		t.Fatal(err)

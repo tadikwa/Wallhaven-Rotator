@@ -1,4 +1,4 @@
-name: Publish unsigned release
+name: Publish release
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
       version:
         description: 'Public release version'
         required: true
-        default: '1.1.0'
+        default: '1.2.0'
 
 permissions:
   contents: write
@@ -40,17 +40,17 @@ jobs:
         with:
           python-version: '3.13.5'
 
-      - name: Build unsigned setup
+      - name: Build setup
         shell: pwsh
         run: ./scripts/Build.ps1 -Version "${{ inputs.version }}"
 
-      - name: Prepare unsigned public asset
+      - name: Prepare SHA-256 manifest
         shell: pwsh
         run: |
           $v = "${{ inputs.version }}"
-          Copy-Item "dist/WallhavenRotator-Setup-v$v.exe" "dist/WallhavenRotator-Setup-v$v-unsigned.exe"
-          $hash = Get-FileHash "dist/WallhavenRotator-Setup-v$v-unsigned.exe" -Algorithm SHA256
-          "{0}  WallhavenRotator-Setup-v{1}-unsigned.exe" -f $hash.Hash.ToLowerInvariant(), $v |
+          $setup = "dist/WallhavenRotator-Setup-v$v.exe"
+          $hash = Get-FileHash $setup -Algorithm SHA256
+          "{0}  WallhavenRotator-Setup-v{1}.exe" -f $hash.Hash.ToLowerInvariant(), $v |
             Set-Content "dist/SHA256SUMS.txt" -Encoding ASCII
 
       - name: Create release notes from resolved issues
@@ -64,8 +64,6 @@ jobs:
           $repo = "${{ github.repository }}"
           $sha = "${{ github.sha }}"
 
-          # A normal Wallhaven Rotator release is triggered after its release PR
-          # has been merged to main. Ask GitHub which PR(s) contain this commit.
           $prs = @(
             gh api `
               -H "Accept: application/vnd.github+json" `
@@ -78,7 +76,6 @@ jobs:
 
           foreach ($pr in $prs) {
             $body = [string]$pr.body
-
             if ([string]::IsNullOrWhiteSpace($body)) {
               continue
             }
@@ -126,17 +123,11 @@ jobs:
 
           $changelogText
 
-          ## Download and signing
+          ## Download integrity
 
-          The unsigned installer is built by GitHub Actions from the public source repository.
+          The official Windows installer is built by GitHub Actions from this public repository.
 
-          After SignPath Foundation approval, the signed installer will be added to this same release as ``WallhavenRotator-Setup-v$v.exe``; the original unsigned asset remains available for provenance.
-
-          ## Code signing policy
-
-          See [CODE_SIGNING.md](https://github.com/${{ github.repository }}/blob/${{ github.sha }}/CODE_SIGNING.md).
-
-          Free code signing provided by SignPath.io, certificate by SignPath Foundation.
+          Verify the downloaded installer against `SHA256SUMS.txt` if you want an independent integrity check.
 
           ## Privacy
 
@@ -154,7 +145,7 @@ jobs:
           $tag = "v$v"
 
           gh release create $tag `
-            "dist/WallhavenRotator-Setup-v$v-unsigned.exe#Unsigned installer" `
+            "dist/WallhavenRotator-Setup-v$v.exe#Windows x64 installer" `
             "dist/SHA256SUMS.txt#SHA-256 checksums" `
             --target "${{ github.sha }}" `
             --title "Wallhaven Rotator $v" `

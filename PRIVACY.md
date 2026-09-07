@@ -19,3 +19,14 @@ public latest-release metadata; the project does not run its own update or analy
 
 Wallhaven is a third-party service and its own terms/privacy policy apply to
 requests made to its service.
+
+
+## Content filtering and local history
+
+Reduced/Strict filtering requests Wallhaven's public wallpaper-detail endpoint
+for category/tag metadata before a candidate is downloaded.
+
+The desktop rotator and Wallhaven Screensaver share local anti-repeat state in
+`%LOCALAPPDATA%\WallhavenShared\history.json`. This state contains Wallhaven
+IDs, local display timestamps and short-lived pending reservations. It is not
+sent to the project or to any analytics service.

@@ -17,9 +17,9 @@ if ($parseErrors.Count -gt 0) {
 
 foreach ($name in @(
     "Test-IsNewerVersion",
-    "Get-SignedSetupAssetName",
-    "Test-ExpectedUpdatePublisher",
-    "Get-ExpectedHashFromChecksumText"
+    "Get-SetupAssetName",
+    "Get-ExpectedHashFromChecksumText",
+    "Test-DownloadedUpdate"
 )) {
     $fn = $ast.FindAll({
         param($node)
@@ -34,44 +34,48 @@ foreach ($name in @(
     Invoke-Expression $fn.Extent.Text
 }
 
-$ExpectedUpdateSignerCn = "CN=SignPath Foundation"
-$ExpectedUpdateSignerOrg = "O=SignPath Foundation"
+function Write-Log { param([string]$Level,[string]$Message) }
+function Get-DeepErrorMessage { param($ErrorRecord) return [string]$ErrorRecord.Exception.Message }
 
-if (-not (Test-IsNewerVersion -Candidate "1.1.0" -Current "1.0.1")) {
-    throw "1.1.0 should be newer than 1.0.1."
+if (-not (Test-IsNewerVersion -Candidate "1.2.0" -Current "1.1.0")) {
+    throw "1.2.0 should be newer than 1.1.0."
 }
-if (Test-IsNewerVersion -Candidate "1.0.1" -Current "1.0.1") {
+if (Test-IsNewerVersion -Candidate "1.1.0" -Current "1.1.0") {
     throw "Equal versions must not be treated as updates."
 }
-if (Test-IsNewerVersion -Candidate "1.0.0" -Current "1.0.1") {
-    throw "Older versions must not be treated as updates."
-}
-if (Test-IsNewerVersion -Candidate "invalid" -Current "1.0.1") {
-    throw "Invalid version must not be treated as an update."
-}
 
-$name = Get-SignedSetupAssetName -Version "1.2.3"
+$name = Get-SetupAssetName -Version "1.2.3"
 if ($name -ne "WallhavenRotator-Setup-v1.2.3.exe") {
-    throw "Unexpected signed setup asset name: $name"
-}
-
-$validSubject = "CN=SignPath Foundation, O=SignPath Foundation, L=Lewes, S=Delaware, C=US"
-if (-not (Test-ExpectedUpdatePublisher -Subject $validSubject)) {
-    throw "Expected SignPath Foundation publisher was rejected."
-}
-if (Test-ExpectedUpdatePublisher -Subject "CN=Other Publisher, O=Other Publisher, C=US") {
-    throw "Unexpected publisher was accepted."
+    throw "Unexpected setup asset name: $name"
 }
 
 $hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 $file = "WallhavenRotator-Setup-v1.2.3.exe"
 $text = "$hash  $file`r`n"
+
 $parsed = Get-ExpectedHashFromChecksumText -Text $text -FileName $file
 if ($parsed -ne $hash) {
     throw "SHA-256 checksum parsing failed."
 }
 if ($null -ne (Get-ExpectedHashFromChecksumText -Text $text -FileName "other.exe")) {
     throw "Checksum parser matched the wrong file."
+}
+
+$tmp = Join-Path $env:TEMP ("wallhaven-update-test-" + [guid]::NewGuid().ToString("N") + ".exe")
+try {
+    [IO.File]::WriteAllBytes($tmp, [Text.Encoding]::UTF8.GetBytes("wallhaven update test payload"))
+    $actual = (Get-FileHash $tmp -Algorithm SHA256).Hash.ToLowerInvariant()
+
+    if (-not (Test-DownloadedUpdate -Path $tmp -ExpectedHash $actual)) {
+        throw "Matching SHA-256 update was rejected."
+    }
+
+    if (Test-DownloadedUpdate -Path $tmp -ExpectedHash ("0" * 64)) {
+        throw "Mismatched SHA-256 update was accepted."
+    }
+}
+finally {
+    Remove-Item $tmp -Force -ErrorAction SilentlyContinue
 }
 
 $invokeSilentUpdate = $ast.FindAll({

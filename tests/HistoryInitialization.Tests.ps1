@@ -2,6 +2,7 @@
 
 $Root = Split-Path -Parent $PSScriptRoot
 $Source = Join-Path $Root "src\Wallhaven-Wallpaper-Tray.ps1"
+$Policy = Join-Path $Root "src\Wallhaven-SharedPolicy.ps1"
 
 $tokens = $null
 $parseErrors = $null
@@ -15,75 +16,89 @@ if ($parseErrors.Count -gt 0) {
     throw "Runtime source does not parse: $($parseErrors[0].Message)"
 }
 
-foreach ($name in @(
-    "Load-WallpaperHistory",
-    "Save-WallpaperHistory",
-    "Add-WallpaperToHistory"
-)) {
-    $fn = $ast.FindAll({
-        param($node)
-        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-        $node.Name -eq $name
-    }, $true) | Select-Object -First 1
-
-    if ($null -eq $fn) {
-        throw "Function '$name' not found in runtime source."
-    }
-
-    Invoke-Expression $fn.Extent.Text
-}
-
-$HistoryMaxIds = 1000
-$HistoryPath = Join-Path $env:TEMP (
-    "wallhaven-history-test-{0}.json" -f [Guid]::NewGuid().ToString("N")
-)
+$testRoot = Join-Path $env:TEMP ("wallhaven-history-init-" + [guid]::NewGuid().ToString("N"))
+$env:WALLHAVEN_SHARED_BASE_DIR = $testRoot
+$env:WALLHAVEN_SHARED_MUTEX_NAME = "Local\WallhavenHistoryInit-" + [guid]::NewGuid().ToString("N")
+$env:WALLHAVEN_LEGACY_ROTATOR_HISTORY_PATH = Join-Path $testRoot "legacy-rotator-history.json"
+$env:WALLHAVEN_LEGACY_SCREENSAVER_HISTORY_PATH = Join-Path $testRoot "legacy-screensaver-history.json"
 
 try {
-    # Fresh install: no history.json. Must return an actual empty List, never $null.
-    Remove-Item $HistoryPath -Force -ErrorAction SilentlyContinue
-    $fresh = Load-WallpaperHistory
+    . $Policy
+    Set-SharedHistoryTestNow "2026-09-06T12:00:00Z"
 
-    if ($null -eq $fresh) {
-        throw "Fresh history initialization returned `$null."
+    foreach ($name in @(
+        "Get-SharedHistoryOrderedIds",
+        "Load-WallpaperHistory",
+        "Refresh-SharedHistoryView",
+        "Save-WallpaperHistory",
+        "Add-WallpaperToHistory",
+        "Get-HistoryTail"
+    )) {
+        $fn = $ast.FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq $name
+        }, $true) | Select-Object -First 1
+
+        if ($null -eq $fn) {
+            throw "Function '$name' not found in runtime source."
+        }
+
+        Invoke-Expression $fn.Extent.Text
     }
 
-    if ($fresh -isnot [System.Collections.Generic.List[string]]) {
-        throw "Fresh history has unexpected type: $($fresh.GetType().FullName)"
+    $HistoryMaxIds = 5000
+    $script:HistoryIds = Load-WallpaperHistory
+
+    if ($null -eq $script:HistoryIds) {
+        throw "Fresh shared history initialization returned `$null."
     }
 
-    if ($fresh.Count -ne 0) {
-        throw "Fresh history should contain 0 IDs, got $($fresh.Count)."
+    if ($script:HistoryIds -isnot [System.Collections.Generic.List[string]]) {
+        throw "Fresh history has unexpected type: $($script:HistoryIds.GetType().FullName)"
     }
 
-    $script:HistoryIds = $fresh
+    if ($script:HistoryIds.Count -ne 0) {
+        throw "Fresh shared history should contain 0 IDs."
+    }
+
     Add-WallpaperToHistory -Id "abc123"
 
     if ($script:HistoryIds.Count -ne 1 -or $script:HistoryIds[0] -ne "abc123") {
-        throw "Adding the first wallpaper ID failed."
+        throw "First shared history commit failed."
     }
 
-    if (-not (Test-Path $HistoryPath)) {
-        throw "history.json was not created after adding an ID."
+    # Exercise the existing-destination atomic replacement path more than once.
+    Add-WallpaperToHistory -Id "def456"
+    if ($script:HistoryIds.Count -ne 2 -or -not $script:HistoryIds.Contains("abc123") -or -not $script:HistoryIds.Contains("def456")) {
+        throw "Repeated shared history replacement failed."
     }
 
-    $saved = Get-Content $HistoryPath -Raw | ConvertFrom-Json
-    if (@($saved.ids).Count -ne 1 -or [string]$saved.ids[0] -ne "abc123") {
-        throw "Persisted history does not contain the expected ID."
+    $leftovers = @(
+        Get-ChildItem -Path $testRoot -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like "history.*.tmp" -or $_.Name -like "history.*.bak" }
+    )
+    if ($leftovers.Count -ne 0) {
+        throw "Atomic history writer left temporary/backup files behind: $($leftovers.Name -join ', ')"
     }
 
-    # A one-item history must also remain List[string], not collapse to a scalar string.
-    $loaded = Load-WallpaperHistory
-
-    if ($loaded -isnot [System.Collections.Generic.List[string]]) {
-        throw "One-item history has unexpected type: $($loaded.GetType().FullName)"
+    $snapshot = Get-SharedHistorySnapshot
+    foreach ($id in @("abc123", "def456")) {
+        if (-not $snapshot.History.Contains($id)) {
+            throw "Shared persisted history does not contain $id."
+        }
+        if (-not $snapshot.SeenToday.Contains($id)) {
+            throw "Successful commit was not added to seenToday: $id."
+        }
     }
 
-    if ($loaded.Count -ne 1 -or $loaded[0] -ne "abc123") {
-        throw "One-item history reload failed."
-    }
-
-    Write-Host "History initialization regression test: OK" -ForegroundColor Green
+    Write-Host "Shared history initialization regression test: OK" -ForegroundColor Green
 }
 finally {
-    Remove-Item $HistoryPath -Force -ErrorAction SilentlyContinue
+    Set-SharedHistoryTestNow $null
+    Remove-Item Env:WALLHAVEN_SHARED_BASE_DIR -ErrorAction SilentlyContinue
+    Remove-Item Env:WALLHAVEN_SHARED_MUTEX_NAME -ErrorAction SilentlyContinue
+    Remove-Item Env:WALLHAVEN_LEGACY_ROTATOR_HISTORY_PATH -ErrorAction SilentlyContinue
+    Remove-Item Env:WALLHAVEN_LEGACY_SCREENSAVER_HISTORY_PATH -ErrorAction SilentlyContinue
+    Remove-Item $testRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
