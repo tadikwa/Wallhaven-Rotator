@@ -35,6 +35,7 @@ $CacheDir = Join-Path $BaseDir "cache"
 $LogDir = Join-Path $BaseDir "logs"
 $SettingsPath = Join-Path $BaseDir "settings.json"
 $HistoryPath = Join-Path $BaseDir "history.json"
+$MetadataCachePath = Join-Path $BaseDir "metadata-cache.json"
 $ShowRequestPath = Join-Path $BaseDir "show.request"
 $UpdateDir = Join-Path $BaseDir "updates"
 
@@ -58,6 +59,8 @@ $CacheMaxFiles = 50
 $CacheMaxBytes = 524288000  # 500 MiB
 $ApiSelectionAttemptsPerMode = 4
 $MetadataChecksPerSelection = 16
+$MetadataCacheMaxEntries = 1200
+$MetadataCacheMaxAgeDays = 7
 
 New-Item -ItemType Directory -Path $BaseDir -Force | Out-Null
 New-Item -ItemType Directory -Path $CacheDir -Force | Out-Null
@@ -601,6 +604,99 @@ function Get-HistoryTail {
     if ($Count -le 0 -or $ordered.Count -eq 0) { return @() }
     $start = [math]::Max(0, $ordered.Count - $Count)
     return @($ordered[$start..($ordered.Count - 1)])
+}
+
+
+# Store raw Wallhaven tags/category, not a previous Strict verdict. On each
+# cache hit the CURRENT content policy is evaluated. A stale entry is ignored.
+function Load-MetadataCache {
+    $script:MetadataCache = @{}
+    $script:MetadataCacheDirty = $false
+    if (-not (Test-Path $MetadataCachePath)) { return }
+
+    try {
+        $data = Get-Content -Path $MetadataCachePath -Raw | ConvertFrom-Json
+        if ([int]$data.schema -ne 1) { return }
+        $cutoff = [DateTime]::UtcNow.AddDays(-1 * $MetadataCacheMaxAgeDays)
+        foreach ($entry in @($data.entries)) {
+            $id = [string]$entry.id
+            $checked = [DateTime]::MinValue
+            if (
+                [string]::IsNullOrWhiteSpace($id) -or
+                -not [DateTime]::TryParse([string]$entry.checkedAt, [ref]$checked) -or
+                $checked.ToUniversalTime() -lt $cutoff -or
+                [string]::IsNullOrWhiteSpace([string]$entry.category)
+            ) { continue }
+            $script:MetadataCache[$id] = [pscustomobject]@{
+                id = $id
+                category = [string]$entry.category
+                tags = @($entry.tags | ForEach-Object { [string]$_ })
+                checkedAt = $checked.ToUniversalTime().ToString("o")
+            }
+        }
+    }
+    catch {
+        Write-Log "WARN" "Cache de métadonnées illisible ; vérifications réseau conservées : $($_.Exception.Message)"
+        $script:MetadataCache = @{}
+    }
+}
+
+function Get-CachedContentDecision {
+    param([string]$Id, [string]$Mode)
+    if (-not $script:MetadataCache.ContainsKey($Id)) { return $null }
+
+    $entry = $script:MetadataCache[$Id]
+    $checked = [DateTime]::MinValue
+    if (
+        -not [DateTime]::TryParse([string]$entry.checkedAt, [ref]$checked) -or
+        $checked.ToUniversalTime() -lt [DateTime]::UtcNow.AddDays(-1 * $MetadataCacheMaxAgeDays)
+    ) {
+        [void]$script:MetadataCache.Remove($Id)
+        $script:MetadataCacheDirty = $true
+        return $null
+    }
+    return (Get-ContentFilterDecision -WallhavenCategory ([string]$entry.category) -Tags @($entry.tags) -Mode $Mode)
+}
+
+function Remember-WallhavenMetadata {
+    param([string]$Id, [string]$Category, [string[]]$Tags)
+    if ([string]::IsNullOrWhiteSpace($Id) -or [string]::IsNullOrWhiteSpace($Category)) { return }
+    $script:MetadataCache[$Id] = [pscustomobject]@{
+        id = $Id
+        category = $Category
+        tags = @($Tags)
+        checkedAt = [DateTime]::UtcNow.ToString("o")
+    }
+    $script:MetadataCacheDirty = $true
+}
+
+function Save-MetadataCache {
+    if (-not $script:MetadataCacheDirty) { return }
+    try {
+        $cutoff = [DateTime]::UtcNow.AddDays(-1 * $MetadataCacheMaxAgeDays)
+        $valid = @(
+            $script:MetadataCache.Values |
+                Where-Object {
+                    $checked = [DateTime]::MinValue
+                    [DateTime]::TryParse([string]$_.checkedAt, [ref]$checked) -and
+                    $checked.ToUniversalTime() -ge $cutoff
+                } |
+                Sort-Object checkedAt -Descending |
+                Select-Object -First $MetadataCacheMaxEntries
+        )
+        $content = ConvertTo-Json -InputObject ([pscustomobject]@{
+            schema = 1
+            entries = $valid
+        }) -Depth 6
+        # Disposable cache: a damaged file simply causes a new online check.
+        Set-Content -Path $MetadataCachePath -Value $content -Encoding UTF8
+        $script:MetadataCache = @{}
+        foreach ($entry in $valid) { $script:MetadataCache[[string]$entry.id] = $entry }
+        $script:MetadataCacheDirty = $false
+    }
+    catch {
+        Write-Log "WARN" "Impossible de sauvegarder le cache de métadonnées : $($_.Exception.Message)"
+    }
 }
 
 function Get-SelectionPageLimit {
@@ -1314,6 +1410,7 @@ try {
 } catch {}
 
 $script:Settings = Load-Settings
+Load-MetadataCache
 $script:Running = [bool]$script:Settings.autoRotation
 $script:NextChange = $null
 $script:State = "Idle"
@@ -2377,6 +2474,7 @@ function Finish-NoEligibleCandidate {
     $script:DownloadTask = $null
     $script:Candidate = $null
     $script:CandidateQueue = @()
+    Save-MetadataCache
 
     Set-Status "Aucun nouveau fond éligible pour le moment · image actuelle conservée."
     Write-Log "WARN" "Sélection sans candidat : $Reason"
@@ -2386,6 +2484,37 @@ function Finish-NoEligibleCandidate {
     }
 
     Refresh-DiagnosticsUi
+}
+
+
+function Start-RecycleSelection {
+    param([string]$Reason = "pool inédit épuisé")
+
+    if ($script:ReservedCandidateId) {
+        Release-SharedWallpaperReservation -Id $script:ReservedCandidateId
+        $script:ReservedCandidateId = $null
+    }
+
+    $script:AllowRecentHistoryRecycle = $true
+    # This stage needs its own metadata budget, including when the initial
+    # search exhausted all 16 checks before reaching reusable history IDs.
+    $script:MetadataChecks = 0
+    $script:ApiAttempt = 0
+    $script:PagesTried = @()
+    $script:ApiTask = $null
+    $script:MetadataTask = $null
+    $script:CandidateQueue = @()
+    $script:Candidate = $null
+    $script:State = "Idle"
+
+    $useResolution = [bool]$script:ApiUsedResolution
+    $target = Get-TargetDisplayFilter
+    if (Test-ResolutionFallbackAllowed -Target $target -UseResolution $useResolution) {
+        $useResolution = $false
+    }
+
+    Write-Log "INFO" "Recyclage long-terme (oldest-first, vu aujourd'hui interdit) : $Reason"
+    Start-ApiRequest -UseResolution $useResolution
 }
 
 function Retry-ApiSelection {
@@ -2420,15 +2549,7 @@ function Retry-ApiSelection {
     }
 
     if (-not $script:AllowRecentHistoryRecycle) {
-        $script:AllowRecentHistoryRecycle = $true
-        $script:ApiAttempt = 0
-        $script:PagesTried = @()
-        $script:ApiTask = $null
-        $script:MetadataTask = $null
-        $script:CandidateQueue = @()
-        $script:State = "Idle"
-        Write-Log "INFO" "Pool inédit épuisé ; recyclage long-terme oldest-first, seenToday toujours interdit."
-        Start-ApiRequest -UseResolution ([bool]$script:ApiUsedResolution)
+        Start-RecycleSelection -Reason $Reason
         return $true
     }
 
@@ -2496,11 +2617,30 @@ function Begin-CandidateEvaluation {
             return
         }
 
+        $cachedDecision = Get-CachedContentDecision -Id $id -Mode ([string]$script:Settings.contentFilter)
+        if ($null -ne $cachedDecision) {
+            if (-not $cachedDecision.Allowed) {
+                Release-SharedWallpaperReservation -Id $id
+                $script:ReservedCandidateId = $null
+                Write-CandidateDiagnostic -Kind strict -Id $id -Detail ("source=metadata_cache reasons=" + ($cachedDecision.Reasons -join "|"))
+                continue
+            }
+            Begin-CandidateDownload
+            return
+        }
+
         if ($script:MetadataChecks -ge $MetadataChecksPerSelection) {
             Release-SharedWallpaperReservation -Id $id
             $script:ReservedCandidateId = $null
-            Write-CandidateDiagnostic -Kind strict -Id $id -Detail "reason=metadata_limit"
-            continue
+            # Quota exhaustion is NOT a content rejection.
+            # Stop immediately instead of reserving/releasing thousands of IDs.
+            if (-not $script:AllowRecentHistoryRecycle) {
+                Start-RecycleSelection -Reason "budget métadonnées épuisé"
+            }
+            else {
+                Finish-NoEligibleCandidate -Reason "budget de métadonnées épuisé pendant le recyclage"
+            }
+            return
         }
 
         $script:MetadataChecks++
@@ -2560,9 +2700,12 @@ function Handle-RequestFailure {
 
     Set-Status "Erreur : $Message"
     Write-Log "ERROR" $Message
+    Save-MetadataCache
 
     if ($script:Running) {
-        $script:NextChange = [DateTime]::Now.AddMinutes(1)
+        # Back off when Wallhaven rejects excessive API traffic.
+        $retryMinutes = if ($Message -match "429|Too Many Requests") { 15 } else { 1 }
+        $script:NextChange = [DateTime]::Now.AddMinutes($retryMinutes)
     }
 
     if ($script:PendingManual) {
@@ -2602,6 +2745,7 @@ function Complete-Wallpaper {
         Write-Log "INFO" "Fond appliqué : $id $resolution $category"
 
         Trim-WallpaperCache -KeepPath $FilePath
+        Save-MetadataCache
 
         $script:State = "Idle"
         $script:Candidate = $null
@@ -2706,6 +2850,8 @@ function Process-AsyncState {
                     Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
             )
 
+            Remember-WallhavenMetadata -Id $id -Category ([string]$detail.data.category) -Tags $tags
+
             $decision = Get-ContentFilterDecision `
                 -WallhavenCategory ([string]$detail.data.category) `
                 -Tags $tags `
@@ -2731,12 +2877,18 @@ function Process-AsyncState {
             Begin-CandidateDownload
         }
         catch {
+            $message = Get-DeepErrorMessage $_
             Release-SharedWallpaperReservation -Id $id
             $script:ReservedCandidateId = $null
             $script:MetadataTask = $null
             $script:State = "Idle"
-            Write-CandidateDiagnostic -Kind strict -Id $id -Detail ("reason=metadata_failure " + (Get-DeepErrorMessage $_))
-            Begin-CandidateEvaluation
+            if ($message -match "429|Too Many Requests") {
+                Handle-RequestFailure -Message $message
+            }
+            else {
+                Write-CandidateDiagnostic -Kind strict -Id $id -Detail ("reason=metadata_failure " + $message)
+                Begin-CandidateEvaluation
+            }
         }
         return
     }
