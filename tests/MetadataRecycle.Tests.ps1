@@ -58,6 +58,7 @@ try {
     function Begin-CandidateDownload {
         $script:Downloaded = [string]$script:Candidate.id
     }
+    function Start-CachedSelection { return $false }
     function Finish-NoEligibleCandidate {
         param([string]$Reason)
         $script:Finished = $Reason
@@ -66,6 +67,8 @@ try {
     $MetadataCacheMaxAgeDays = 7
     $MetadataCacheMaxEntries = 1200
     $MetadataChecksPerSelection = 16
+    $script:SelectionSeenIds = @{}
+    $script:SelectionStats = $null
 
     Load-MetadataCache
     if ($script:MetadataCache.Count -ne 0) { throw "Fresh cache should be empty." }
@@ -126,8 +129,8 @@ try {
         throw "Exhausted recycle budget must terminate selection immediately."
     }
 
-    # The actual recycling transition gives a fresh budget and preserves
-    # the 32:9 ratio while allowing only the minimum-size fallback.
+    # Recycling no longer replenishes the total per-change allowance.
+    # With no cached candidate it must stop without another search.
     $script:AllowRecentHistoryRecycle = $false
     $script:MetadataChecks = 16
     $script:ApiUsedResolution = $true
@@ -137,11 +140,11 @@ try {
     Start-RecycleSelection -Reason "test quota"
     if (
         -not $script:AllowRecentHistoryRecycle -or
-        $script:MetadataChecks -ne 0 -or
-        $script:StartApiCalls -ne 1 -or
-        $script:RequestedResolution
+        $script:MetadataChecks -ne 16 -or
+        $script:StartApiCalls -ne 0 -or
+        -not $script:RequestedResolution
     ) {
-        throw "Recycling did not restart metadata budget with same ratio and relaxed minimum."
+        throw "Recycling replenished the total budget or sent an unnecessary search."
     }
 
     Write-Host "Metadata-cache / exhausted-budget / Strict recycling tests: OK" -ForegroundColor Green

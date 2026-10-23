@@ -1,4 +1,5 @@
-﻿$ErrorActionPreference = 'Stop'
+﻿param([switch]$LoadFixtureOnly,[string]$RuntimeSource='')
+$ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
 $testRoot = Join-Path $env:TEMP ('wallhaven-engine-' + [guid]::NewGuid().ToString('N'))
 $env:WALLHAVEN_SHARED_BASE_DIR = $testRoot
@@ -10,7 +11,8 @@ $failures = @()
 try {
     . (Join-Path $Root 'src/Wallhaven-SharedPolicy.ps1')
     $tokens = $null; $errors = $null
-    $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $Root 'src/Wallhaven-Wallpaper-Tray.ps1'), [ref]$tokens, [ref]$errors)
+    if (-not $RuntimeSource) { $RuntimeSource=Join-Path $Root 'src/Wallhaven-Wallpaper-Tray.ps1' }
+    $ast = [Management.Automation.Language.Parser]::ParseFile($RuntimeSource, [ref]$tokens, [ref]$errors)
     if ($errors.Count) { throw $errors[0] }
     # Real selection, persistence and shared history; only HTTP and desktop/UI are replaced.
     foreach ($fn in $ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
@@ -21,7 +23,9 @@ try {
             'Complete-Wallpaper','Get-ApiUrl','Get-SelectionPage','Get-SelectionPageLimit','ConvertTo-QueryString',
             'Get-WallhavenResponseJson','Get-WallhavenRatioForSize','Test-ImageBytes',
             'Get-ResolutionQueryParameters','Test-ResolutionFallbackAllowed','Get-DeepErrorMessage',
-            'Get-LocalSelectionKey','Start-CachedSelection')) {
+            'Get-LocalSelectionKey','Start-CachedSelection','Start-WallhavenApiTask',
+            'Initialize-SelectionCycle','Write-SelectionSummary','Load-SearchCache','Save-SearchCache',
+            'Start-DiscoveredSelection','Get-QualifiedCandidateRank','Stop-SelectionRequests')) {
             Invoke-Expression $fn.Extent.Text
         }
     }
@@ -35,8 +39,20 @@ public class SelectionHttpFixture {
     public Queue<string> Replies = new Queue<string>();
     public Dictionary<string,string> UrlReplies = new Dictionary<string,string>();
     public byte[] DownloadBytes;
+    public long NowTicks;
+    public List<long> Times = new List<long>();
+    public Task<System.Net.Http.HttpResponseMessage> GetAsync(string url, System.Threading.CancellationToken token) {
+        return GetAsync(url);
+    }
     public Task<System.Net.Http.HttpResponseMessage> GetAsync(string url) {
         Requests.Add(url);
+        if (url.StartsWith("https://w.wallhaven.cc/")) {
+            var image = new TaskCompletionSource<System.Net.Http.HttpResponseMessage>();
+            if (DownloadBytes == null) image.SetException(new Exception("download failed"));
+            else image.SetResult(new System.Net.Http.HttpResponseMessage(System.Net.HttpStatusCode.OK) { Content = new System.Net.Http.ByteArrayContent(DownloadBytes) });
+            return image.Task;
+        }
+        Times.Add(NowTicks);
         var t = new TaskCompletionSource<System.Net.Http.HttpResponseMessage>();
         string reply = UrlReplies.ContainsKey(url) ? UrlReplies[url] : (Replies.Count > 0 ? Replies.Dequeue() : "ERROR:offline");
         if (reply.StartsWith("ERROR:429")) {
@@ -60,7 +76,7 @@ public class SelectionHttpFixture {
 }
 '@
     function Assert($Condition, [string]$Message) { if (-not $Condition) { throw $Message } }
-    function Write-Log { param($Level, $Message) }
+    function Write-Log { param($Level, $Message) $script:Logs+=([string]$Message) }
     function Set-Status { param($Message) }
     function Write-CandidateDiagnostic { param($Kind,$Id,$Detail) $script:Diagnostics += "$Kind|$Id|$Detail" }
     function Refresh-DiagnosticsUi {}
@@ -68,6 +84,10 @@ public class SelectionHttpFixture {
     function Trim-WallpaperCache { param($KeepPath) }
     function Schedule-NextChange { $script:NextChange = [DateTime]::Now.AddHours(1) }
     function Set-WindowsWallpaper { param($Path) $script:Applied += $Path }
+    function Advance-FixtureClock([double]$Seconds=3) {
+        Set-SharedHistoryTestNow ((Get-SharedHistoryNow).AddSeconds($Seconds).ToString('o'))
+        $script:HttpClient.NowTicks=(Get-SharedHistoryNow).UtcTicks
+    }
     function Get-TargetDisplayFilter { [pscustomobject]@{Width=5120;Height=1440;Ratio='32x9';MatchMode=$(if($script:ExactTarget){'Exacte'}else{'Au moins'});IsExact=$script:ExactTarget} }
     function Candidate([string]$Id) {
         [pscustomobject]@{id=$Id;path="https://w.wallhaven.cc/full/aa/wallhaven-$Id.jpg";
@@ -75,21 +95,31 @@ public class SelectionHttpFixture {
             dimension_x=5120;dimension_y=1440;file_type='image/jpeg';purity='sfw';selectionKey=(Get-LocalSelectionKey)}
     }
     function Reset-Fixture {
+        if (Get-Command Stop-SelectionRequests -ErrorAction SilentlyContinue) { Stop-SelectionRequests }
         Reset-SharedWallpaperHistory
         Set-SharedHistoryTestNow '2026-10-23T12:00:00Z'
         $script:Settings = [pscustomobject]@{contentFilter='Strict';query='';category='General';sort='Random'}
         $script:ExactTarget=$true
         $script:HttpClient = New-Object SelectionHttpFixture
+        $script:HttpClient.NowTicks=(Get-SharedHistoryNow).UtcTicks
         $script:State='Idle'; $script:Running=$true; $script:PendingManual=$false
         $script:NextChange=$null; $script:ApiRetryAfter=$null; $script:ApiAttempt=0
         $script:MetadataChecks=0; $script:AllowRecentHistoryRecycle=$false
         $script:ReservedCandidateId=$null; $script:Candidate=$null; $script:CandidateQueue=@()
         $script:ApiTask=$null; $script:MetadataTask=$null; $script:DownloadTask=$null
         $script:PageCeilings=@{}; $script:PagesTried=@()
-        $script:Diagnostics=@(); $script:Applied=@(); $script:OfflineSelection=$false
+        $script:Diagnostics=@(); $script:Logs=@(); $script:Applied=@(); $script:OfflineSelection=$false
         $script:MetadataCache=@{}; $script:MetadataCacheDirty=$false
         $script:ApiUsedResolution=$true
         $script:LastWallpaperId=$null
+        $script:DeferredApiRequest=$null
+        $script:ApiCachedJson=$null
+        $script:SearchCache=@{}; $script:SearchCacheDirty=$false
+        $script:SelectionSearches=0; $script:SelectionSeenIds=@{}; $script:SelectionUrls=@{}
+        $script:SelectionDeadline=(Get-SharedHistoryNow).AddSeconds(45)
+        $script:SelectionSummaryWritten=$false; $script:SelectionStats=$null
+        Remove-Item -LiteralPath $script:WallhavenApiBudgetPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $MetadataCachePath,$SearchCachePath -Force -ErrorAction SilentlyContinue
     }
     function Test-Case([string]$Name, [scriptblock]$Body) {
         try { Reset-Fixture; & $Body; Write-Host "PASS $Name" }
@@ -103,11 +133,16 @@ public class SelectionHttpFixture {
     try { $bitmap.Save($imageBuffer,[Drawing.Imaging.ImageFormat]::Jpeg); $fixtureImage=$imageBuffer.ToArray() }
     finally { $bitmap.Dispose(); $imageBuffer.Dispose() }
     $MetadataCachePath = Join-Path $testRoot 'metadata-cache.json'
+    $SearchCachePath = Join-Path $testRoot 'search-cache.json'
     $MetadataCacheMaxAgeDays=7; $MetadataCacheMaxEntries=1200
-    $MetadataChecksPerSelection=16; $ApiSelectionAttemptsPerMode=4
+    $MetadataChecksPerSelection=6; $ApiSelectionAttemptsPerMode=4
+    $SearchRequestsPerSelection=2
     $ApiBase='https://wallhaven.cc/api/v1/search'
     $menuCurrent=[pscustomobject]@{Enabled=$false}
     $CurrentWallpaperButton=[pscustomobject]@{IsEnabled=$false}
+    if (-not $LoadFixtureOnly) {
+    Set-Item Function:Process-AsyncStateCore (Get-Item Function:Process-AsyncState).ScriptBlock
+    function Process-AsyncState { Advance-FixtureClock; Process-AsyncStateCore }
 
     Test-Case 'quota skips unknowns and still finds validated candidates' {
         Remember-WallhavenMetadata -Id 'cached' -Category general -Tags @('forest')
@@ -135,8 +170,8 @@ public class SelectionHttpFixture {
         Handle-RequestFailure -Message '429 Too Many Requests'
         Start-WallpaperChange -Reason Manual
         Assert ($script:HttpClient.Requests.Count -eq 0) 'Manual request bypassed 429 cooldown.'
-        Assert ($script:ApiRetryAfter -gt [DateTime]::Now.AddMinutes(14)) '429 did not set a persistent cooldown.'
-        $script:ApiRetryAfter=[DateTime]::Now.AddSeconds(-1)
+        Assert ($script:ApiRetryAfter -gt (Get-SharedHistoryNow).LocalDateTime.AddMinutes(14)) '429 did not set a persistent cooldown.'
+        Advance-FixtureClock -Seconds 901
         Start-WallpaperChange -Reason Manual
         Assert ($script:HttpClient.Requests.Count -eq 1) 'Selection did not resume after cooldown.'
     }
@@ -211,7 +246,8 @@ public class SelectionHttpFixture {
         for($i=0;$i -lt 12;$i++) { $script:HttpClient.Replies.Enqueue('{"data":[],"meta":{"last_page":1}}') }
         Start-WallpaperChange
         foreach($tick in 1..12) { Process-AsyncState }
-        Assert ($script:State -eq 'Idle' -and $script:HttpClient.Requests.Count -eq 8) 'Empty API/recycle did not terminate at bounded attempts.'
+        Assert ($script:State -eq 'Idle' -and $script:HttpClient.Requests.Count -eq 2) 'Only the filtered query and user-only query may be searched once each.'
+        Assert (@($script:HttpClient.Requests | Select-Object -Unique).Count -eq 2) 'A cached empty query was sent again.'
         foreach($url in $script:HttpClient.Requests) {
             Assert ($url -match 'ratios=32x9' -and $url -match 'resolutions=5120x1440') 'Exact resolution/ratio changed.'
         }
@@ -223,7 +259,8 @@ public class SelectionHttpFixture {
         Assert ((Get-SharedHistorySnapshot).PendingCount -eq 0) 'Download failure leaked reservation.'
         Assert (-not (Get-SharedHistorySnapshot).SeenToday.Contains('dlerr')) 'Failed download consumed daily ID.'
         Start-WallpaperChange
-        Assert ($script:State -eq 'Api') 'Failed download prevented subsequent rotation.'
+        Assert ($script:State -eq 'Download') 'A qualified discovery should retry its image without another API search.'
+        Assert (@($script:HttpClient.Requests | Where-Object { $_ -like 'https://wallhaven.cc/api/*' }).Count -eq 0) 'Known download failure triggered an unnecessary API search.'
     }
     Test-Case 'malformed metadata never becomes a Strict acceptance' {
         $script:HttpClient.Replies.Enqueue('{"data":{"id":"invalid","category":"general"}}')
@@ -254,14 +291,14 @@ public class SelectionHttpFixture {
         Assert ($script:Applied.Count -eq 2) 'Offline cache ignored changed search query.'
     }
     Test-Case '429 Retry-After delta and date are respected on search and metadata' {
-        foreach($retry in @('1800', [DateTime]::UtcNow.AddMinutes(35).ToString('r'))) {
+        foreach($retry in @('1800', ([DateTimeOffset]::Parse('2026-10-23T12:35:00Z')).ToString('r'))) {
             foreach($stage in @('Api','Metadata')) {
                 Reset-Fixture
                 $script:HttpClient.Replies.Enqueue("ERROR:429 $retry")
                 if($stage -eq 'Api') { Start-WallpaperChange }
                 else { $script:CandidateQueue=@((Candidate ratelimit)); Begin-CandidateEvaluation }
                 Process-AsyncState
-                Assert ($script:ApiRetryAfter -gt [DateTime]::Now.AddMinutes(29)) 'Server Retry-After was ignored.'
+                Assert ($script:ApiRetryAfter -gt (Get-SharedHistoryNow).LocalDateTime.AddMinutes(29)) 'Server Retry-After was ignored.'
                 Assert ((Get-SharedHistorySnapshot).PendingCount -eq 0) '429 leaked a reservation.'
             }
         }
@@ -353,26 +390,29 @@ public class SelectionHttpFixture {
         $script:HttpClient.Replies.Enqueue((ConvertTo-Json -Depth 5 -InputObject @{data=@((Candidate recycled));meta=@{last_page=1}}))
         Start-WallpaperChange
         foreach($tick in 1..20) { Process-AsyncState }
-        Assert ($script:AllowRecentHistoryRecycle -and $script:MetadataChecks -eq 0) 'Recycling did not receive fresh metadata budget.'
-        Assert ($script:LastWallpaperId -eq 'recycled' -and $script:HttpClient.Requests.Count -eq 18) 'Cached long history did not apply after 16 metadata checks and two searches.'
+        Assert ($script:MetadataChecks -le $MetadataChecksPerSelection) 'Recycling reset the total per-change metadata budget.'
+        Assert ($script:HttpClient.Requests.Count -le 12) 'Selection exceeded the global Rotator budget.'
     }
     Test-Case 'minimum-size fallback remains 32:9 and bounded' {
         $script:ExactTarget=$false
         foreach($i in 1..16) { $script:HttpClient.Replies.Enqueue('{"data":[],"meta":{"last_page":1}}') }
         Start-WallpaperChange
         foreach($i in 1..16) { Process-AsyncState }
-        Assert ($script:State -eq 'Idle' -and $script:HttpClient.Requests.Count -eq 12) 'Fallback/recycle retries were unbounded.'
+        Assert ($script:State -eq 'Idle' -and $script:HttpClient.Requests.Count -eq 2) 'Fallback must use at most two distinct searches, reusing cached pages.'
         foreach($url in $script:HttpClient.Requests) { Assert ($url -match 'ratios=32x9' -and $url -notmatch '16x9') 'Fallback changed ratio.' }
         Assert ($script:HttpClient.Requests[0] -match 'atleast=5120x1440') 'Initial minimum resolution lost.'
     }
     if ($failures.Count) { throw ($failures -join "`n") }
     Write-Host 'Selection engine regression tests: OK'
+    }
 }
 finally {
+    if (-not $LoadFixtureOnly) {
     Set-SharedHistoryTestNow $null
     foreach($name in @('WALLHAVEN_SHARED_BASE_DIR','WALLHAVEN_SHARED_MUTEX_NAME','WALLHAVEN_LEGACY_ROTATOR_HISTORY_PATH','WALLHAVEN_LEGACY_SCREENSAVER_HISTORY_PATH')) {
         Remove-Item "Env:$name" -ErrorAction SilentlyContinue
     }
     # Only this invocation's isolated fixture directory is removed.
     Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }

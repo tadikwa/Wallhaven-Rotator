@@ -1,5 +1,9 @@
 # Validation du correctif de sélection
 
+Note historique : ce document décrit la validation du commit 635fa28. Le budget
+par phase a depuis été remplacé par un budget global persistant. Voir
+[NetworkBudget-results.md](NetworkBudget-results.md) pour le correctif actuel.
+
 ## Cause de l'échec initial de CI
 
 Le job du run 39918172243 (workflow Build #36, PR #10, commit 89aecc8)
