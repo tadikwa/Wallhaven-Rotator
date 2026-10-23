@@ -618,21 +618,27 @@ function Load-MetadataCache {
         $data = Get-Content -Path $MetadataCachePath -Raw | ConvertFrom-Json
         if ([int]$data.schema -ne 1) { return }
         $cutoff = [DateTime]::UtcNow.AddDays(-1 * $MetadataCacheMaxAgeDays)
-        foreach ($entry in @($data.entries)) {
+        foreach ($entry in @($data.entries | Sort-Object checkedAt -Descending)) {
             $id = [string]$entry.id
             $checked = [DateTime]::MinValue
             if (
                 [string]::IsNullOrWhiteSpace($id) -or
                 -not [DateTime]::TryParse([string]$entry.checkedAt, [ref]$checked) -or
                 $checked.ToUniversalTime() -lt $cutoff -or
-                [string]::IsNullOrWhiteSpace([string]$entry.category)
+                $checked.ToUniversalTime() -gt [DateTime]::UtcNow.AddMinutes(5) -or
+                [string]$entry.category -notin @('general', 'anime', 'people') -or
+                $entry.tags -isnot [array] -or
+                @($entry.tags | Where-Object { $_ -isnot [string] -or [string]::IsNullOrWhiteSpace($_) }).Count -gt 0
             ) { continue }
             $script:MetadataCache[$id] = [pscustomobject]@{
                 id = $id
                 category = [string]$entry.category
                 tags = @($entry.tags | ForEach-Object { [string]$_ })
                 checkedAt = $checked.ToUniversalTime().ToString("o")
+                candidate = $entry.candidate
+                selectionKey = [string]$entry.selectionKey
             }
+            if ($script:MetadataCache.Count -ge $MetadataCacheMaxEntries) { break }
         }
     }
     catch {
@@ -649,7 +655,8 @@ function Get-CachedContentDecision {
     $checked = [DateTime]::MinValue
     if (
         -not [DateTime]::TryParse([string]$entry.checkedAt, [ref]$checked) -or
-        $checked.ToUniversalTime() -lt [DateTime]::UtcNow.AddDays(-1 * $MetadataCacheMaxAgeDays)
+        $checked.ToUniversalTime() -lt [DateTime]::UtcNow.AddDays(-1 * $MetadataCacheMaxAgeDays) -or
+        $checked.ToUniversalTime() -gt [DateTime]::UtcNow.AddMinutes(5)
     ) {
         [void]$script:MetadataCache.Remove($Id)
         $script:MetadataCacheDirty = $true
@@ -688,8 +695,20 @@ function Save-MetadataCache {
             schema = 1
             entries = $valid
         }) -Depth 6
-        # Disposable cache: a damaged file simply causes a new online check.
-        Set-Content -Path $MetadataCachePath -Value $content -Encoding UTF8
+        # The single-instance mutex owns this cache; replace atomically so a
+        # crash cannot truncate the last usable offline metadata.
+        $tmp = "$MetadataCachePath.$([guid]::NewGuid().ToString('N')).tmp"
+        $backup = "$tmp.bak"
+        try {
+            [IO.File]::WriteAllText($tmp, $content, (New-Object Text.UTF8Encoding($true)))
+            if (Test-Path $MetadataCachePath) {
+                [IO.File]::Replace($tmp, $MetadataCachePath, $backup, $true)
+            }
+            else { [IO.File]::Move($tmp, $MetadataCachePath) }
+        }
+        finally {
+            Remove-Item -LiteralPath $tmp, $backup -Force -ErrorAction SilentlyContinue
+        }
         $script:MetadataCache = @{}
         foreach ($entry in $valid) { $script:MetadataCache[[string]$entry.id] = $entry }
         $script:MetadataCacheDirty = $false
@@ -1421,6 +1440,9 @@ $script:Candidate = $null
 $script:CandidateQueue = @()
 $script:ReservedCandidateId = $null
 $script:MetadataChecks = 0
+$script:ApiRetryAfter = $null
+$script:ApiSelectionKey = ""
+$script:OfflineSelection = $false
 $script:AllowRecentHistoryRecycle = $false
 $script:ApiUsePolicyQuery = $true
 $script:CandidateDiagnostics = [ordered]@{
@@ -2388,8 +2410,9 @@ function Start-ApiRequest {
             -UsePolicyQuery ([bool]$script:ApiUsePolicyQuery)
 
         $script:ApiUsedResolution = $UseResolution
+        $script:ApiSelectionKey = Get-LocalSelectionKey
         $script:State = "Api"
-        $script:ApiTask = $script:HttpClient.GetStringAsync($url)
+        $script:ApiTask = $script:HttpClient.GetAsync($url)
 
         if ((Get-SelectionPageLimit) -gt 1) {
             Set-Status "Recherche Wallhaven · page $($script:ApiCurrentPage)..."
@@ -2407,6 +2430,27 @@ function Start-ApiRequest {
     catch {
         Handle-RequestFailure -Message (Get-DeepErrorMessage $_)
     }
+}
+
+function Get-WallhavenResponseJson {
+    param($Task)
+    $response = $Task.GetAwaiter().GetResult()
+    try {
+        if ([int]$response.StatusCode -eq 429) {
+            $script:ApiRetryAfter = [DateTime]::Now.AddMinutes(15)
+            $retry = $response.Headers.RetryAfter
+            if ($retry) {
+                $until = if ($retry.Delta) { [DateTime]::Now.Add($retry.Delta) }
+                         elseif ($retry.Date) { $retry.Date.LocalDateTime }
+                if ($until -gt $script:ApiRetryAfter) { $script:ApiRetryAfter = $until }
+            }
+            throw "Wallhaven HTTP 429 : trop de requêtes."
+        }
+        [void]$response.EnsureSuccessStatusCode()
+        # GetAsync buffers the content before its task completes.
+        return $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+    }
+    finally { $response.Dispose() }
 }
 
 function Get-EligibleCandidates {
@@ -2563,6 +2607,10 @@ function Begin-CandidateDownload {
         Retry-ApiSelection -Reason "candidat absent" | Out-Null
         return
     }
+    if ($candidate.selectionKey -and [string]$candidate.selectionKey -ne (Get-LocalSelectionKey)) {
+        Finish-NoEligibleCandidate -Reason "réglages modifiés pendant la sélection"
+        return
+    }
 
     $imageUri = [Uri]::new([string]$candidate.path)
     $ext = [IO.Path]::GetExtension($imageUri.AbsolutePath).ToLowerInvariant()
@@ -2573,11 +2621,43 @@ function Begin-CandidateDownload {
     $filePath = Join-Path $CacheDir ("wallhaven-{0}{1}" -f $candidate.id, $ext)
     $script:Candidate | Add-Member -NotePropertyName LocalFilePath -NotePropertyValue $filePath -Force
 
+    if ($script:MetadataCache.ContainsKey([string]$candidate.id) -and -not $script:OfflineSelection) {
+        $entry = $script:MetadataCache[[string]$candidate.id]
+        $key = [string]$candidate.selectionKey
+        if (-not $entry.candidate -or [string]$entry.selectionKey -ne $key) {
+            $entry | Add-Member -NotePropertyName candidate -NotePropertyValue ($candidate | Select-Object id,path,url,category,resolution,dimension_x,dimension_y,file_type,selectionKey) -Force
+            $entry | Add-Member -NotePropertyName selectionKey -NotePropertyValue $key -Force
+            $script:MetadataCacheDirty = $true
+        }
+    }
+
     if (Test-Path $filePath) {
+        if ($script:OfflineSelection) {
+            $image = $null
+            try {
+                $image = [Drawing.Image]::FromFile($filePath)
+                if ($image.Width -ne [int]$candidate.dimension_x -or $image.Height -ne [int]$candidate.dimension_y) {
+                    throw "Dimensions du fichier local incohérentes."
+                }
+            }
+            catch {
+                Write-Log "WARN" "Image locale invalide id=$($candidate.id) : $($_.Exception.Message)"
+                Release-SharedWallpaperReservation -Id ([string]$candidate.id)
+                $script:ReservedCandidateId = $null
+                Begin-CandidateEvaluation
+                return
+            }
+            finally { if ($image) { $image.Dispose() } }
+        }
         try { (Get-Item $filePath).LastWriteTime = [DateTime]::Now } catch {}
         Write-Log "INFO" "CACHE HIT $($candidate.id) -> $filePath"
         $script:State = "Idle"
         Complete-Wallpaper -FilePath $filePath -Candidate $candidate
+        return
+    }
+
+    if ($script:OfflineSelection) {
+        Finish-NoEligibleCandidate -Reason "fichier local devenu indisponible"
         return
     }
 
@@ -2588,6 +2668,7 @@ function Begin-CandidateDownload {
 }
 
 function Begin-CandidateEvaluation {
+    $budgetExhausted = $false
     while (@($script:CandidateQueue).Count -gt 0) {
         $candidate = $script:CandidateQueue[0]
         if ($script:CandidateQueue.Count -gt 1) {
@@ -2598,6 +2679,19 @@ function Begin-CandidateEvaluation {
         }
 
         $id = [string]$candidate.id
+        $requiresMetadata = Test-ContentFilterRequiresMetadata -Mode ([string]$script:Settings.contentFilter)
+        $cachedDecision = if ($requiresMetadata) {
+            Get-CachedContentDecision -Id $id -Mode ([string]$script:Settings.contentFilter)
+        } else { $null }
+        if ($null -ne $cachedDecision -and -not $cachedDecision.Allowed) {
+            Write-CandidateDiagnostic -Kind strict -Id $id -Detail ("source=metadata_cache reasons=" + ($cachedDecision.Reasons -join "|"))
+            continue
+        }
+        if ($requiresMetadata -and $null -eq $cachedDecision -and $script:MetadataChecks -ge $MetadataChecksPerSelection) {
+            # Scan the rest of this page for cache hits without reserving misses.
+            $budgetExhausted = $true
+            continue
+        }
         $reservation = Reserve-SharedWallpaper -Id $id
         if (-not $reservation.Reserved) {
             if ($reservation.Reason -eq "daily_repeat") {
@@ -2612,34 +2706,8 @@ function Begin-CandidateEvaluation {
         $script:Candidate = $candidate
         $script:ReservedCandidateId = $id
 
-        if (-not (Test-ContentFilterRequiresMetadata -Mode ([string]$script:Settings.contentFilter))) {
+        if (-not $requiresMetadata -or $null -ne $cachedDecision) {
             Begin-CandidateDownload
-            return
-        }
-
-        $cachedDecision = Get-CachedContentDecision -Id $id -Mode ([string]$script:Settings.contentFilter)
-        if ($null -ne $cachedDecision) {
-            if (-not $cachedDecision.Allowed) {
-                Release-SharedWallpaperReservation -Id $id
-                $script:ReservedCandidateId = $null
-                Write-CandidateDiagnostic -Kind strict -Id $id -Detail ("source=metadata_cache reasons=" + ($cachedDecision.Reasons -join "|"))
-                continue
-            }
-            Begin-CandidateDownload
-            return
-        }
-
-        if ($script:MetadataChecks -ge $MetadataChecksPerSelection) {
-            Release-SharedWallpaperReservation -Id $id
-            $script:ReservedCandidateId = $null
-            # Quota exhaustion is NOT a content rejection.
-            # Stop immediately instead of reserving/releasing thousands of IDs.
-            if (-not $script:AllowRecentHistoryRecycle) {
-                Start-RecycleSelection -Reason "budget métadonnées épuisé"
-            }
-            else {
-                Finish-NoEligibleCandidate -Reason "budget de métadonnées épuisé pendant le recyclage"
-            }
             return
         }
 
@@ -2647,12 +2715,23 @@ function Begin-CandidateEvaluation {
         $metadataUrl = "https://wallhaven.cc/api/v1/w/$id"
         Set-Status "Vérification des métadonnées Wallhaven..."
         Write-Log "DEBUG" "METADATA GET $metadataUrl"
-        $script:MetadataTask = $script:HttpClient.GetStringAsync($metadataUrl)
+        $script:MetadataTask = $script:HttpClient.GetAsync($metadataUrl)
         $script:State = "Metadata"
         return
     }
 
-    Retry-ApiSelection -Reason "aucun candidat éligible dans la page" | Out-Null
+    if ($budgetExhausted) {
+        if (-not $script:AllowRecentHistoryRecycle) {
+            Start-RecycleSelection -Reason "budget métadonnées épuisé"
+        }
+        else {
+            Finish-NoEligibleCandidate -Reason "budget de métadonnées épuisé pendant le recyclage"
+        }
+    }
+    elseif ($script:OfflineSelection) {
+        Finish-NoEligibleCandidate -Reason "cache local épuisé"
+    }
+    else { Retry-ApiSelection -Reason "aucun candidat éligible dans la page" | Out-Null }
 }
 
 function Start-WallpaperChange {
@@ -2669,10 +2748,19 @@ function Start-WallpaperChange {
         return
     }
 
+    if ($script:ApiRetryAfter -and [DateTime]::Now -lt $script:ApiRetryAfter) {
+        if (-not (Start-CachedSelection)) {
+            $script:NextChange = $script:ApiRetryAfter
+            Set-Status "Wallhaven temporairement limité · image actuelle conservée."
+        }
+        return
+    }
+
     $script:ApiAttempt = 0
     $script:PagesTried = @()
     $script:MetadataChecks = 0
     $script:AllowRecentHistoryRecycle = $false
+    $script:OfflineSelection = $false
     $script:ApiUsePolicyQuery = $true
     $script:CandidateQueue = @()
     $script:Candidate = $null
@@ -2693,6 +2781,7 @@ function Handle-RequestFailure {
     $script:MetadataTask = $null
     $script:DownloadTask = $null
     $script:Candidate = $null
+    $script:CandidateQueue = @()
 
     if ([string]::IsNullOrWhiteSpace($Message)) {
         $Message = "Erreur réseau inconnue."
@@ -2702,16 +2791,59 @@ function Handle-RequestFailure {
     Write-Log "ERROR" $Message
     Save-MetadataCache
 
+    $rateLimited = $Message -match "429|Too Many Requests"
+    if ($rateLimited -and (-not $script:ApiRetryAfter -or $script:ApiRetryAfter -lt [DateTime]::Now)) {
+        $script:ApiRetryAfter = [DateTime]::Now.AddMinutes(15)
+    }
     if ($script:Running) {
-        # Back off when Wallhaven rejects excessive API traffic.
-        $retryMinutes = if ($Message -match "429|Too Many Requests") { 15 } else { 1 }
-        $script:NextChange = [DateTime]::Now.AddMinutes($retryMinutes)
+        $script:NextChange = if ($rateLimited) { $script:ApiRetryAfter } else { [DateTime]::Now.AddMinutes(1) }
     }
 
-    if ($script:PendingManual) {
-        $script:PendingManual = $false
-        Start-WallpaperChange -Reason "Manual"
-    }
+    $script:PendingManual = $false
+    if (-not $script:OfflineSelection) { [void](Start-CachedSelection) }
+}
+
+function Get-LocalSelectionKey {
+    $target = Get-TargetDisplayFilter
+    return (ConvertTo-Json -Compress -InputObject @(
+        [string]$script:Settings.query, [string]$script:Settings.category,
+        [string]$script:Settings.sort, [string]$script:Settings.contentFilter, [string]$target.Ratio,
+        [string]$target.MatchMode, [int]$target.Width, [int]$target.Height
+    ))
+}
+
+function Start-CachedSelection {
+    $key = Get-LocalSelectionKey
+    $target = Get-TargetDisplayFilter
+    $local = @(
+        foreach ($entry in @($script:MetadataCache.Values)) {
+            $candidate = $entry.candidate
+            if (-not $candidate -or [string]$entry.selectionKey -ne $key -or
+                [string]$candidate.id -notmatch '^[a-zA-Z0-9]+$' -or
+                [string]$candidate.id -ne [string]$entry.id) { continue }
+            $decision = Get-CachedContentDecision -Id ([string]$entry.id) -Mode ([string]$script:Settings.contentFilter)
+            if ($null -eq $decision -or -not $decision.Allowed) { continue }
+            $width = 0; $height = 0; $uri = $null
+            if (-not [int]::TryParse([string]$candidate.dimension_x, [ref]$width) -or
+                -not [int]::TryParse([string]$candidate.dimension_y, [ref]$height) -or
+                $width -le 0 -or $height -le 0 -or
+                (Get-WallhavenRatioForSize -Width $width -Height $height) -ne $target.Ratio -or
+                ($target.IsExact -and ($width -ne $target.Width -or $height -ne $target.Height)) -or
+                -not [Uri]::TryCreate([string]$candidate.path, [UriKind]::Absolute, [ref]$uri) -or
+                $uri.Scheme -ne 'https') { continue }
+            $ext = [IO.Path]::GetExtension($uri.AbsolutePath).ToLowerInvariant()
+            if ($ext -notin @('.jpg','.jpeg','.png')) { continue }
+            if (Test-Path -LiteralPath (Join-Path $CacheDir ("wallhaven-{0}{1}" -f $entry.id,$ext))) { $candidate }
+        }
+    )
+    if ($local.Count -eq 0) { return $false }
+    $script:AllowRecentHistoryRecycle = $true
+    $script:CandidateQueue = @(Get-EligibleCandidates -Data $local)
+    if ($script:CandidateQueue.Count -eq 0) { return $false }
+    $script:OfflineSelection = $true
+    $script:PendingManual = $false
+    Begin-CandidateEvaluation
+    return $true
 }
 
 function Complete-Wallpaper {
@@ -2722,6 +2854,10 @@ function Complete-Wallpaper {
 
     $id = [string]$Candidate.id
     try {
+        if ($Candidate.selectionKey -and [string]$Candidate.selectionKey -ne (Get-LocalSelectionKey)) {
+            Finish-NoEligibleCandidate -Reason "réglages modifiés pendant le téléchargement"
+            return
+        }
         Set-WindowsWallpaper -Path $FilePath
 
         Commit-SharedWallpaperShown -Id $id
@@ -2781,12 +2917,16 @@ function Process-AsyncState {
         $script:ApiTask.IsCompleted
     ) {
         try {
-            $json = $script:ApiTask.GetAwaiter().GetResult()
+            $json = Get-WallhavenResponseJson -Task $script:ApiTask
             if ([string]::IsNullOrWhiteSpace($json)) {
                 throw "Wallhaven a renvoyé une réponse vide."
             }
 
             $response = $json | ConvertFrom-Json
+            if ($script:ApiSelectionKey -ne (Get-LocalSelectionKey)) {
+                Finish-NoEligibleCandidate -Reason "réglages modifiés pendant la recherche"
+                return
+            }
             $data = @($response.data)
 
             try {
@@ -2819,6 +2959,9 @@ function Process-AsyncState {
             }
 
             $script:CandidateQueue = @(Get-EligibleCandidates -Data $data)
+            foreach ($candidate in $script:CandidateQueue) {
+                $candidate | Add-Member -NotePropertyName selectionKey -NotePropertyValue $script:ApiSelectionKey -Force
+            }
             $script:ApiTask = $null
             $script:State = "Idle"
 
@@ -2842,8 +2985,14 @@ function Process-AsyncState {
     ) {
         $id = [string]$script:Candidate.id
         try {
-            $metadataJson = $script:MetadataTask.GetAwaiter().GetResult()
+            $metadataJson = Get-WallhavenResponseJson -Task $script:MetadataTask
             $detail = $metadataJson | ConvertFrom-Json
+            if ([string]$detail.data.id -ne $id -or
+                [string]$detail.data.category -notin @('general','anime','people') -or
+                $detail.data.tags -isnot [array] -or
+                @($detail.data.tags | Where-Object { $_.name -isnot [string] -or [string]::IsNullOrWhiteSpace($_.name) }).Count -gt 0) {
+                throw "Métadonnées Wallhaven incomplètes ou invalides."
+            }
             $tags = @(
                 @($detail.data.tags) |
                     ForEach-Object { [string]$_.name } |
@@ -2882,13 +3031,7 @@ function Process-AsyncState {
             $script:ReservedCandidateId = $null
             $script:MetadataTask = $null
             $script:State = "Idle"
-            if ($message -match "429|Too Many Requests") {
-                Handle-RequestFailure -Message $message
-            }
-            else {
-                Write-CandidateDiagnostic -Kind strict -Id $id -Detail ("reason=metadata_failure " + $message)
-                Begin-CandidateEvaluation
-            }
+            Handle-RequestFailure -Message $message
         }
         return
     }

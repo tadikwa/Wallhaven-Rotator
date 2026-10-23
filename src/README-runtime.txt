@@ -58,6 +58,20 @@ Limites :
 - 50 fichiers maximum
 - 500 MiB maximum
 
+Les tags/catégories Wallhaven sont conservés séparément dans
+%LOCALAPPDATA%\WallhavenWallpaperRotator\metadata-cache.json
+(1 200 entrées maximum, validité 7 jours, remplacement atomique).
+Chaque utilisation réévalue le filtre actif ; le cache ne mémorise pas un verdict.
+Le recyclage reçoit un nouveau budget de 16 vérifications réseau et n'autorise
+jamais une image déjà affichée aujourd'hui. Un quota technique n'est pas un refus Strict.
+
+En cas d'indisponibilité de Wallhaven, les images déjà téléchargées et validées
+peuvent être réutilisées avec les mêmes réglages de recherche, taille, ratio et
+filtrage. Les fichiers invalides sont ignorés. Sans candidat local admissible,
+le fond actuel reste affiché. Les erreurs 429 suspendent les recherches pendant
+au moins 15 minutes, ou davantage selon Retry-After ; un clic manuel respecte
+aussi cette pause. Aucun historique ni réglage n'est effacé.
+
 Réseau / vie privée
 -------------------
 L'application contacte Wallhaven pour rechercher/télécharger les fonds et,
