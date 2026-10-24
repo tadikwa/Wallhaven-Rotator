@@ -19,6 +19,7 @@ $script:WallhavenSharedBaseDir = if ($env:WALLHAVEN_SHARED_BASE_DIR) {
 }
 
 $script:WallhavenSharedHistoryPath = Join-Path $script:WallhavenSharedBaseDir "history.json"
+$script:WallhavenApiBudgetPath = Join-Path $script:WallhavenSharedBaseDir "api-budget.json"
 $script:WallhavenSharedOwner = "rotator:{0}:{1}" -f $PID, ([guid]::NewGuid().ToString("N"))
 
 $script:WallhavenLegacyRotatorHistoryPath = if ($env:WALLHAVEN_LEGACY_ROTATOR_HISTORY_PATH) {
@@ -50,6 +51,110 @@ function Set-SharedHistoryTestNow {
     } else {
         $script:WallhavenSharedTestNow = [DateTimeOffset]::Parse([string]$Value)
     }
+}
+
+# API permits are separate from history. All cooperating clients use this file
+# and mutex; writing a permit BEFORE dispatch also counts failed HTTP requests.
+function Get-WallhavenApiPermit {
+    param(
+        [string]$RequestKey,
+        [ValidateSet('Rotator','Screensaver')][string]$Client = 'Rotator',
+        [Nullable[DateTimeOffset]]$CooldownUntil
+    )
+    $now = Get-SharedHistoryNow
+    $retryAt = $now.AddSeconds(60)
+    $mutex = $null; $acquired = $false
+    try {
+        $mutex = New-Object Threading.Mutex($false, ($script:WallhavenSharedMutexName + '-ApiBudget'))
+        try { $acquired = $mutex.WaitOne($(if ($CooldownUntil) { 500 } else { 0 })) }
+        catch [Threading.AbandonedMutexException] { $acquired = $true }
+        if (-not $acquired) {
+            return [pscustomobject]@{ Granted=$false; Persisted=$false; RetryAt=$now.AddSeconds(1); Reason='budget_busy' }
+        }
+        $state = [pscustomobject]@{ schema=1; notBefore=''; requests=@() }
+        if (Test-Path -LiteralPath $script:WallhavenApiBudgetPath) {
+            if ((Get-Item -LiteralPath $script:WallhavenApiBudgetPath).Length -gt 65536) { throw 'API budget too large.' }
+            $state = Get-Content -LiteralPath $script:WallhavenApiBudgetPath -Raw | ConvertFrom-Json
+            if ([int]$state.schema -ne 1 -or $state.requests -isnot [array]) { throw 'Invalid API budget schema.' }
+        }
+        $notBefore = ConvertTo-SharedDateTimeOffset $state.notBefore
+        if ($state.notBefore -and -not $notBefore) { throw 'Invalid API cooldown.' }
+        $receipts = @(
+            foreach ($receipt in $state.requests) {
+                $at = ConvertTo-SharedDateTimeOffset $receipt.at
+                if (-not $at -or -not $receipt.client -or -not $receipt.key) { throw 'Invalid API receipt.' }
+                # Retain future timestamps if the system clock moves backwards.
+                if ($at -ge $now.AddSeconds(-60)) { $receipt }
+            }
+        )
+        $changed = $false
+        if ($CooldownUntil -and (-not $notBefore -or $CooldownUntil -gt $notBefore)) {
+            $notBefore = [DateTimeOffset]$CooldownUntil
+            $state.notBefore = $notBefore.ToString('o')
+            $changed = $true
+        }
+        $waitUntil = $now
+        if ($notBefore -and $notBefore -gt $waitUntil) { $waitUntil = $notBefore }
+        $ordered = @($receipts | Sort-Object at)
+        if ($ordered.Count -gt 0) {
+            $spacing = ([DateTimeOffset]::Parse($ordered[-1].at)).AddMilliseconds(2600)
+            if ($spacing -gt $waitUntil) { $waitUntil = $spacing }
+        }
+        if ($ordered.Count -ge 24) {
+            $until = ([DateTimeOffset]::Parse($ordered[-24].at)).AddMilliseconds(60001)
+            if ($until -gt $waitUntil) { $waitUntil = $until }
+        }
+        $own = @($ordered | Where-Object { $_.client -eq 'Rotator' })
+        # Leave headroom for the current, independently limited 30/min Screensaver.
+        if ($Client -eq 'Rotator' -and $own.Count -ge 12) {
+            $until = ([DateTimeOffset]::Parse($own[-12].at)).AddMilliseconds(60001)
+            if ($until -gt $waitUntil) { $waitUntil = $until }
+        }
+        if ($RequestKey -like 'metadata:*') {
+            $same = @($ordered | Where-Object { $_.key -eq $RequestKey })
+            if ($same.Count) {
+                $until = ([DateTimeOffset]::Parse($same[-1].at)).AddMilliseconds(60001)
+                if ($until -gt $waitUntil) { $waitUntil = $until }
+            }
+        }
+        $granted = -not $CooldownUntil -and $waitUntil -le $now
+        if ($granted) {
+            if ([string]::IsNullOrWhiteSpace($RequestKey)) { throw 'Missing API request key.' }
+            $receipts += [pscustomobject]@{ at=$now.ToUniversalTime().ToString('o'); client=$Client; key=$RequestKey }
+            $changed = $true
+        }
+        if ($changed) {
+            $state.requests = $receipts
+            [void][IO.Directory]::CreateDirectory($script:WallhavenSharedBaseDir)
+            $tmp = $script:WallhavenApiBudgetPath + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
+            $backup = $tmp + '.bak'
+            try {
+                [IO.File]::WriteAllText($tmp, (ConvertTo-Json -InputObject $state -Depth 5), (New-Object Text.UTF8Encoding($true)))
+                if (Test-Path -LiteralPath $script:WallhavenApiBudgetPath) {
+                    [IO.File]::Replace($tmp, $script:WallhavenApiBudgetPath, $backup, $true)
+                }
+                else { [IO.File]::Move($tmp, $script:WallhavenApiBudgetPath) }
+            }
+            finally { Remove-Item -LiteralPath $tmp,$backup -Force -ErrorAction SilentlyContinue }
+        }
+        return [pscustomobject]@{ Granted=$granted; Persisted=$true; RetryAt=$waitUntil; Reason=$(if ($notBefore -and $notBefore -gt $now) {'cooldown'} else {'rate_budget'}) }
+    }
+    catch {
+        # A damaged or unwritable ledger must never replenish the API budget.
+        return [pscustomobject]@{ Granted=$false; Persisted=$false; RetryAt=$retryAt; Reason=('budget_unavailable: ' + $_.Exception.Message) }
+    }
+    finally {
+        if ($mutex) {
+            if ($acquired) { [void]$mutex.ReleaseMutex() }
+            $mutex.Dispose()
+        }
+    }
+}
+
+function Set-WallhavenApiCooldown {
+    param([DateTimeOffset]$Until)
+    $result = Get-WallhavenApiPermit -CooldownUntil $Until
+    if (-not $result.Persisted) { throw "Impossible de persister la pause API : $($result.Reason)" }
 }
 
 $script:FilterQueryExclusions = @(
