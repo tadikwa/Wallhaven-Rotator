@@ -8,6 +8,7 @@ import (
 	"embed"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -322,7 +323,7 @@ func detectedInstalledVersion() string {
 	return marker.Version
 }
 
-func isRunning() bool {
+var isRunning = func() bool {
 	h, _, _ := procOpenMutexW.Call(SYNCHRONIZE, 0, uintptr(unsafe.Pointer(utf16Ptr(mutexName))))
 	if h == 0 {
 		return false
@@ -472,7 +473,7 @@ func runValueExists() bool {
 	return r == 0 && valueType == REG_SZ && size > 2
 }
 
-func setRunValue(command string) error {
+var setRunValue = func(command string) error {
 	const subkey = `Software\Microsoft\Windows\CurrentVersion\Run`
 	var key uintptr
 	r, _, _ := procRegCreateKeyExW.Call(
@@ -499,7 +500,7 @@ func setRunValue(command string) error {
 	return nil
 }
 
-func deleteRunValue() {
+var deleteRunValue = func() {
 	const subkey = `Software\Microsoft\Windows\CurrentVersion\Run`
 	var key uintptr
 	r, _, _ := procRegCreateKeyExW.Call(
@@ -533,6 +534,13 @@ func installWithLaunch(launchMode string, enableAutostart bool) error {
 	}
 
 	dir := appPath()
+	shortcut, err := startMenuShortcutPath()
+	if err != nil {
+		return fmt.Errorf("menu Démarrer: %w", err)
+	}
+	if _, err = existingStartMenuShortcut(shortcut, dir); err != nil {
+		return fmt.Errorf("menu Démarrer: %w", err)
+	}
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
@@ -565,6 +573,9 @@ func installWithLaunch(launchMode string, enableAutostart bool) error {
 
 	if err := cleanOldSettings(filepath.Join(dir, "settings.json")); err != nil {
 		return fmt.Errorf("settings.json: %w", err)
+	}
+	if err := ensureStartMenuShortcut(dir); err != nil {
+		return fmt.Errorf("menu Démarrer: %w", err)
 	}
 
 	windir := os.Getenv("WINDIR")
@@ -639,7 +650,7 @@ func silentUpdate(enableAutostart bool) error {
 	return nil
 }
 
-func launchInstalledApp(dir, mode string) {
+var launchInstalledApp = func(dir, mode string) {
 	windir := os.Getenv("WINDIR")
 	if windir == "" {
 		windir = `C:\Windows`
@@ -664,10 +675,20 @@ func uninstall() error {
 	if isRunning() {
 		return fmt.Errorf("Wallhaven Rotator est actuellement en cours d'exécution.\n\nQuittez-le d'abord depuis son icône dans la zone de notification (clic droit > Quitter), puis relancez le setup pour le désinstaller.")
 	}
-	deleteRunValue()
 	dir := appPath()
+	shortcut, err := startMenuShortcutPath()
+	if err != nil {
+		return fmt.Errorf("menu Démarrer: %w", err)
+	}
+	if _, err = existingStartMenuShortcut(shortcut, dir); err != nil && !errors.Is(err, errForeignShortcut) {
+		return fmt.Errorf("menu Démarrer: %w", err)
+	}
+	deleteRunValue()
 	if err := os.RemoveAll(dir); err != nil {
 		return err
+	}
+	if err := removeStartMenuShortcut(dir); err != nil {
+		return fmt.Errorf("menu Démarrer: %w", err)
 	}
 	return nil
 }
