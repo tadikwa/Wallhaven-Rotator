@@ -93,3 +93,19 @@ if ($invokeSilentUpdate.Extent.Text -notmatch 'Save-UiSettings\s+-ShowValidation
 }
 
 Write-Host "Update helper tests: OK" -ForegroundColor Green
+
+# Execute the updater hand-off; the process boundary is replaced, no installer runs.
+Invoke-Expression $invokeSilentUpdate.Extent.Text
+function Save-UiSettings { param($ShowValidation) return $true }
+function Test-RunAtLogon { return $false }
+function Start-Process { param($FilePath,$ArgumentList) $script:UpdaterStarted=$true }
+function Request-DesktopExit { $script:ExitRequested=$true }
+$script:UpdateReadyPath=Join-Path $env:TEMP ('wallhaven-ota-fixture-'+[guid]::NewGuid().ToString('N')+'.exe')
+try {
+    [IO.File]::WriteAllText($script:UpdateReadyPath,'not executable')
+    $script:UpdaterStarted=$false; $script:ExitRequested=$false
+    Invoke-SilentUpdate
+    if(-not $script:UpdaterStarted -or -not $script:ExitRequested) { throw 'OTA must use cooperative worker shutdown before releasing the instance mutex.' }
+    Write-Host 'OTA cooperative shutdown hand-off: OK'
+}
+finally { Remove-Item -LiteralPath $script:UpdateReadyPath -Force -ErrorAction SilentlyContinue }

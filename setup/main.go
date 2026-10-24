@@ -258,6 +258,7 @@ type payloadItem struct {
 var payload = []payloadItem{
 	{"Wallhaven-Wallpaper-Tray.ps1"},
 	{"Wallhaven-SharedPolicy.ps1"},
+	{"Wallhaven-Desktop.ps1"},
 	{"Wallhaven-Rotator-Launcher.vbs"},
 	{"Wallhaven-Rotator.ico"},
 	{"Wallhaven-Rotator.png"},
