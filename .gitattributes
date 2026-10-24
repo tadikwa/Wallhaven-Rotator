@@ -1,0 +1,2 @@
+# Match gofmt so installer build IDs do not depend on core.autocrlf.
+setup/*.go text eol=lf

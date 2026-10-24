@@ -62,6 +62,13 @@ de suppression de l'application est inchange.
 - Deux executions de `scripts/Build.ps1`, meme SHA-256 :
   `4bd3e2a5b3cf34382c0fe4c67c77b2d3140674f55aa9a9b95797ace829a177a2`.
   Installateur `dist/WallhavenRotator-Setup-v1.2.0.exe`, version 1.2.0 inchangee.
+- Le deuxieme cycle a valide les tests Go et le build du push. Son hash
+  differait car le checkout CI utilisait CRLF pour Go, contre LF apres gofmt
+  localement. Le build local en CRLF a reproduit exactement ce hash CI
+  (`e8b9919ef5ce10ed98c34744b93412d596dda3deea20a4e68187ad78caa54e26`).
+  `.gitattributes` fixe maintenant uniquement `setup/*.go` en LF, format de gofmt,
+  pour stabiliser les identifiants de build entre checkouts. Les sources du
+  runtime et du VBS ne sont pas concernees. Le troisieme cycle verifie cet etat.
 
 ## Limites et STOP_GATE
 
