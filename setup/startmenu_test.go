@@ -24,6 +24,10 @@ func shortcutFixture(t *testing.T) (string, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	root, err = filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() { _ = os.RemoveAll(root) })
 	t.Setenv("APPDATA", filepath.Join(root, "Roaming"))
 	t.Setenv("LOCALAPPDATA", filepath.Join(root, "Élève espace"))
@@ -106,9 +110,58 @@ func TestStartMenuManualLauncherShortcutIsAdopted(t *testing.T) {
 	}
 	shortcutWSH(t, path, `$link.TargetPath=$env:LAUNCHER_FIXTURE; $link.Save()`, "LAUNCHER_FIXTURE="+filepath.Join(dir, "Wallhaven-Rotator-Launcher.vbs"))
 	if err := ensureStartMenuShortcut(dir); err != nil {
-		t.Fatal(err)
+		info, readErr := readShellLink(path)
+		t.Fatalf("%v; expected=%s existing=%+v read=%v", err, dir, info, readErr)
 	}
 	assertStartMenuLink(t, path, dir)
+}
+
+func TestStartMenuManualShortcutWithShortProfilePath(t *testing.T) {
+	for _, mode := range []string{"manual", "repaired", "wscript-short-arguments"} {
+		t.Run(mode, func(t *testing.T) {
+			// Hosted runners expose TEMP through the RUNNER~1 alias; the Shell expands it.
+			t.Setenv("TEMP", filepath.Join(os.Getenv("USERPROFILE"), "AppData", "Local", "Temp"))
+			dir, path := shortcutFixture(t)
+			buf := make([]uint16, 32768)
+			n, _, _ := kernel32.NewProc("GetShortPathNameW").Call(uintptr(unsafe.Pointer(utf16Ptr(dir))), uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+			if n == 0 || n >= uintptr(len(buf)) {
+				t.Fatal("GetShortPathNameW failed")
+			}
+			shortDir := syscall.UTF16ToString(buf)
+			if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+				t.Fatal(err)
+			}
+			if mode == "wscript-short-arguments" {
+				shortcutWSH(t, path, `$link.TargetPath=$env:HOST_FIXTURE; $link.Arguments='//B //Nologo "'+$env:LAUNCHER_FIXTURE+'" show'; $link.Save()`, "HOST_FIXTURE="+windowsScriptHost(), "LAUNCHER_FIXTURE="+filepath.Join(shortDir, "Wallhaven-Rotator-Launcher.vbs"))
+			} else {
+				shortcutWSH(t, path, `$link.TargetPath=$env:LAUNCHER_FIXTURE; $link.Save()`, "LAUNCHER_FIXTURE="+filepath.Join(shortDir, "Wallhaven-Rotator-Launcher.vbs"))
+			}
+			info, err := readShellLink(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Logf("expected=%s short=%s stored=%s", dir, shortDir, info.Target)
+			if _, err := existingStartMenuShortcut(path, shortDir); err != nil {
+				t.Fatal(err)
+			}
+			if mode == "repaired" {
+				if err := ensureStartMenuShortcut(shortDir); err != nil {
+					t.Fatal(err)
+				}
+			}
+			t.Setenv("LOCALAPPDATA", filepath.Dir(shortDir))
+			oldRunning, oldDelete := isRunning, deleteRunValue
+			t.Cleanup(func() { isRunning, deleteRunValue = oldRunning, oldDelete })
+			isRunning = func() bool { return false }
+			deleteRunValue = func() {}
+			if err := uninstall(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(path); !os.IsNotExist(err) {
+				t.Fatal("owned shortcut not removed after alias target disappeared")
+			}
+		})
+	}
 }
 
 func TestStartMenuForeignShortcutIsNeverOverwrittenOrDeleted(t *testing.T) {
@@ -124,7 +177,11 @@ func TestStartMenuForeignShortcutIsNeverOverwrittenOrDeleted(t *testing.T) {
 	if err := ensureStartMenuShortcut(dir); err == nil {
 		t.Fatal("foreign shortcut silently replaced")
 	}
-	if err := removeStartMenuShortcut(dir); err != nil {
+	snapshot, err := startMenuShortcutForRemoval(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := removeStartMenuShortcut(snapshot); err != nil {
 		t.Fatal(err)
 	}
 	after, err := os.ReadFile(path)
@@ -273,7 +330,10 @@ func TestStartMenuRejectsUnknownAndForeignScriptLinks(t *testing.T) {
 			if err := ensureStartMenuShortcut(dir); err == nil {
 				t.Fatal("unknown shortcut replaced")
 			}
-			_ = removeStartMenuShortcut(dir)
+			snapshot, err := startMenuShortcutForRemoval(dir)
+			if err == nil {
+				_ = removeStartMenuShortcut(snapshot)
+			}
 			if _, err := os.Stat(path); err != nil {
 				t.Fatal("unknown shortcut removed", err)
 			}
@@ -373,6 +433,29 @@ func TestInstallerForeignShortcutConflictHasNoInstallationSideEffects(t *testing
 	after, err := os.ReadFile(path)
 	if err != nil || !bytes.Equal(before, after) {
 		t.Fatal("uninstall changed foreign shortcut")
+	}
+}
+
+func TestUninstallPreservesShortcutChangedAfterOwnershipCheck(t *testing.T) {
+	dir, path := shortcutFixture(t)
+	if err := ensureStartMenuShortcut(dir); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := startMenuShortcutForRemoval(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shortcutWSH(t, path, `$link.TargetPath=$env:FOREIGN_FIXTURE; $link.Save()`, "FOREIGN_FIXTURE="+filepath.Join(os.Getenv("WINDIR"), "System32", "notepad.exe"))
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := removeStartMenuShortcut(snapshot); err == nil {
+		t.Fatal("changed shortcut was deleted without error")
+	}
+	after, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatal("foreign replacement was deleted")
 	}
 }
 

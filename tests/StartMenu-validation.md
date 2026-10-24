@@ -33,6 +33,13 @@ de suppression de l'application est inchange.
   reinstallation sans doublon, suppression/reparation, adoption du lien manuel,
   OTA, conflit etranger, lien corrompu/repertoire, premier script etranger dans
   les arguments, remplacement verrouille et desinstallation echouee.
+- Le premier cycle CI a revele une difference entre chemin court Windows
+  (`RUNNER~1`) et chemin long renvoye par le Shell pour un lien VBS manuel.
+  Echec reproduit localement avec de vrais alias 8.3, puis corrige via
+  GetLongPathNameW. Les octets du lien reconnu sont memorises avant la suppression
+  de l'application et compares avant son retrait. Trois sous-tests couvrent les
+  liens VBS manuels, repares et WScript avec arguments courts. Un autre test
+  prouve qu'un lien remplace entre reconnaissance et retrait est conserve.
 - Installation/OTA/desinstallation executees dans des dossiers APPDATA et
   LOCALAPPDATA factices ; appels registre, mutex reel et lancement de l'installateur
   remplaces dans ce test. Parametres, caches et historique sont compares octet
@@ -53,7 +60,7 @@ de suppression de l'application est inchange.
   runspace, selection Strict 32:9, historique et budgets reseau.
 - `go vet -unsafeptr=false ./...` vert (commande du build existant).
 - Deux executions de `scripts/Build.ps1`, meme SHA-256 :
-  `3dc4c236d4b4f66759d4490eed24e0b4a9c8eff51ca225fad473205c7ffd18ae`.
+  `4bd3e2a5b3cf34382c0fe4c67c77b2d3140674f55aa9a9b95797ace829a177a2`.
   Installateur `dist/WallhavenRotator-Setup-v1.2.0.exe`, version 1.2.0 inchangee.
 
 ## Limites et STOP_GATE

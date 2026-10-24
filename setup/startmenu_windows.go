@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -166,16 +167,40 @@ func expandedShortcutPath(value string) string {
 	if n == 0 || n > uintptr(len(buf)) {
 		return ""
 	}
-	return filepath.Clean(syscall.UTF16ToString(buf))
+	path := filepath.Clean(syscall.UTF16ToString(buf))
+	// The Shell expands 8.3 aliases. Keep matching after uninstall removes the leaf.
+	// Do not query a foreign UNC target while inspecting an existing shortcut.
+	if strings.HasPrefix(path, `\\`) {
+		return path
+	}
+	var missing []string
+	for prefix := path; ; prefix = filepath.Dir(prefix) {
+		u, err = syscall.UTF16PtrFromString(prefix)
+		if err != nil {
+			return path
+		}
+		n, _, _ = kernel32.NewProc("GetLongPathNameW").Call(uintptr(unsafe.Pointer(u)), uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+		if n > 0 && n < uintptr(len(buf)) {
+			result := syscall.UTF16ToString(buf)
+			for i := len(missing) - 1; i >= 0; i-- {
+				result = filepath.Join(result, missing[i])
+			}
+			return result
+		}
+		if filepath.Dir(prefix) == prefix {
+			return path
+		}
+		missing = append(missing, filepath.Base(prefix))
+	}
 }
 
 func ownsStartMenuShortcut(info shellLinkInfo, dir string) bool {
-	launcher := filepath.Join(dir, "Wallhaven-Rotator-Launcher.vbs")
+	launcher := expandedShortcutPath(filepath.Join(dir, "Wallhaven-Rotator-Launcher.vbs"))
 	target := expandedShortcutPath(info.Target)
 	if strings.EqualFold(target, launcher) {
 		return true
 	} // Manual shortcut directly to our VBS.
-	if !strings.EqualFold(target, windowsScriptHost()) {
+	if !strings.EqualFold(target, expandedShortcutPath(windowsScriptHost())) {
 		return false
 	}
 	var count int32
@@ -219,6 +244,7 @@ func existingStartMenuShortcut(path, dir string) (bool, error) {
 }
 
 func ensureStartMenuShortcut(dir string) error {
+	dir = expandedShortcutPath(dir)
 	path, err := startMenuShortcutPath()
 	if err != nil {
 		return err
@@ -256,20 +282,39 @@ func ensureStartMenuShortcut(dir string) error {
 
 var procSHChangeNotify = shell32.NewProc("SHChangeNotify")
 
-func removeStartMenuShortcut(dir string) error {
+func startMenuShortcutForRemoval(dir string) ([]byte, error) {
+	path, err := startMenuShortcutPath()
+	if err != nil {
+		return nil, err
+	}
+	exists, err := existingStartMenuShortcut(path, dir)
+	if errors.Is(err, errForeignShortcut) {
+		return nil, nil
+	}
+	if err != nil || !exists {
+		return nil, err
+	}
+	return os.ReadFile(path)
+}
+
+func removeStartMenuShortcut(expected []byte) error {
+	if expected == nil {
+		return nil
+	}
 	path, err := startMenuShortcutPath()
 	if err != nil {
 		return err
 	}
-	exists, err := existingStartMenuShortcut(path, dir)
-	if errors.Is(err, errForeignShortcut) {
+	current, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	if !exists {
-		return nil
+	// Ownership was checked while the app existed; 8.3 aliases may no longer resolve.
+	if !bytes.Equal(current, expected) {
+		return fmt.Errorf("raccourci modifié pendant la désinstallation, conservé : %s", path)
 	}
 	if err = os.Remove(path); err != nil {
 		return err

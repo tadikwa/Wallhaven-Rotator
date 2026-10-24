@@ -8,7 +8,6 @@ import (
 	"embed"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -676,18 +675,15 @@ func uninstall() error {
 		return fmt.Errorf("Wallhaven Rotator est actuellement en cours d'exécution.\n\nQuittez-le d'abord depuis son icône dans la zone de notification (clic droit > Quitter), puis relancez le setup pour le désinstaller.")
 	}
 	dir := appPath()
-	shortcut, err := startMenuShortcutPath()
+	shortcut, err := startMenuShortcutForRemoval(dir)
 	if err != nil {
-		return fmt.Errorf("menu Démarrer: %w", err)
-	}
-	if _, err = existingStartMenuShortcut(shortcut, dir); err != nil && !errors.Is(err, errForeignShortcut) {
 		return fmt.Errorf("menu Démarrer: %w", err)
 	}
 	deleteRunValue()
 	if err := os.RemoveAll(dir); err != nil {
 		return err
 	}
-	if err := removeStartMenuShortcut(dir); err != nil {
+	if err := removeStartMenuShortcut(shortcut); err != nil {
 		return fmt.Errorf("menu Démarrer: %w", err)
 	}
 	return nil
