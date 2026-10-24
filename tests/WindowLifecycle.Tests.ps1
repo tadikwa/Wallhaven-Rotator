@@ -3,6 +3,8 @@ $Root=Split-Path -Parent $PSScriptRoot
 . (Join-Path $Root 'src/Wallhaven-Desktop.ps1')
 Add-Type -AssemblyName PresentationFramework
 $window=$null
+$iconFixture=Join-Path $env:TEMP ('wallhaven-icon-'+[guid]::NewGuid().ToString('N')+'.ico')
+Copy-Item -LiteralPath (Join-Path $Root 'assets/Wallhaven-Rotator.ico') -Destination $iconFixture
 try {
     if(-not (Get-Command Register-WallhavenWindowLifecycle -ErrorAction SilentlyContinue)) { throw 'Window close-to-tray lifecycle is missing.' }
     $source=[IO.File]::ReadAllText((Join-Path $Root 'src/Wallhaven-Wallpaper-Tray.ps1'))
@@ -13,7 +15,9 @@ try {
     $window.Title='Wallhaven Rotator - isolated lifecycle test'
     $script:Exiting=$false
     Register-WallhavenWindowLifecycle -Window $window
-    Show-WallhavenWindow -Window $window -IconPath (Join-Path $Root 'assets/Wallhaven-Rotator.ico')
+    Show-WallhavenWindow -Window $window -IconPath $iconFixture
+    $iconStream=[IO.File]::Open($iconFixture,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
+    $iconStream.Dispose()
     $hwnd=([Windows.Interop.WindowInteropHelper]::new($window)).Handle
     $style=[WallhavenDesktopNative]::GetLong($hwnd,-20).ToInt64()
     if(-not $window.IsVisible -or -not $window.ShowInTaskbar -or -not $window.Icon -or
@@ -48,4 +52,4 @@ try {
     $window=$null
     Write-Host 'Real WPF HWND, icon, responsive viewports, close/hide/restore/final close: OK'
 }
-finally { if($window) { $script:Exiting=$true; $window.Close() } }
+finally { if($window) { $script:Exiting=$true; $window.Close() }; Remove-Item -LiteralPath $iconFixture -Force -ErrorAction SilentlyContinue }

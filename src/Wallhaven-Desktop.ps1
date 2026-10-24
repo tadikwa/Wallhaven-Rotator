@@ -196,7 +196,14 @@ function Show-WallhavenWindow {
     $Window.Dispatcher.VerifyAccess()
     Initialize-WallhavenDesktopNative
     if(-not $Window.Icon -and (Test-Path -LiteralPath $IconPath)) {
-        $Window.Icon=[Windows.Media.Imaging.BitmapFrame]::Create([Uri]::new($IconPath))
+        $stream=[IO.File]::OpenRead($IconPath)
+        try {
+            # Fully decode before closing the stream so OTA can replace the ICO.
+            $frame=[Windows.Media.Imaging.BitmapFrame]::Create($stream,[Windows.Media.Imaging.BitmapCreateOptions]::None,[Windows.Media.Imaging.BitmapCacheOption]::OnLoad)
+            $frame.Freeze()
+            $Window.Icon=$frame
+        }
+        finally { $stream.Dispose() }
     }
     $Window.ShowInTaskbar=$true
     $Window.WindowState='Normal'

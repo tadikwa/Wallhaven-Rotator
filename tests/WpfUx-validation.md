@@ -64,6 +64,9 @@ Le correctif OTA a été vérifié rouge puis vert après la revue indépendante
 - Véritable XAML WPF/HWND : icône, propriétaire/styles Win32, visibilité,
   fermeture/masquage/restauration et fermeture finale. Arrangements WPF réels aux
   12 combinaisons résolution/DPI simulées, viewports d'au moins 24 DIPs.
+- Le chargement WPF par URI verrouillait le fichier ICO (ouverture exclusive
+  reproduite en échec). Le chargement OnLoad depuis un stream fermé, puis Freeze,
+  laisse maintenant le fichier remplaçable ; test rouge puis vert.
 - Moteur dans le runspace : cache chaud, historique saturé, clics regroupés,
   commit Screensaver concurrent avant réservation, 429 puis clics sans nouvel API.
 - Charges réseau antérieures : mêmes résultats, plafonds observés de 12/60 s
