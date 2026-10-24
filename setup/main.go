@@ -4,6 +4,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"embed"
 	"encoding/hex"
@@ -11,7 +12,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -146,7 +149,6 @@ var (
 	procRegDeleteValueW  = advapi32.NewProc("RegDeleteValueW")
 	procRegCloseKey      = advapi32.NewProc("RegCloseKey")
 
-	procShellExecuteW    = shell32.NewProc("ShellExecuteW")
 	procGetStockObject   = gdi32.NewProc("GetStockObject")
 	procCreateSolidBrush = gdi32.NewProc("CreateSolidBrush")
 	procDeleteObject     = gdi32.NewProc("DeleteObject")
@@ -258,6 +260,7 @@ type payloadItem struct {
 var payload = []payloadItem{
 	{"Wallhaven-Wallpaper-Tray.ps1"},
 	{"Wallhaven-SharedPolicy.ps1"},
+	{"Wallhaven-Desktop.ps1"},
 	{"Wallhaven-Rotator-Launcher.vbs"},
 	{"Wallhaven-Rotator.ico"},
 	{"Wallhaven-Rotator.png"},
@@ -274,7 +277,7 @@ func utf16Ptr(s string) *uint16 {
 
 func loword(v uintptr) uint16 { return uint16(v & 0xffff) }
 
-func messageBox(text, title string, flags uintptr) {
+var messageBox = func(text, title string, flags uintptr) {
 	procMessageBoxW.Call(hwndMain, uintptr(unsafe.Pointer(utf16Ptr(text))), uintptr(unsafe.Pointer(utf16Ptr(title))), flags)
 }
 
@@ -321,7 +324,7 @@ func detectedInstalledVersion() string {
 	return marker.Version
 }
 
-func isRunning() bool {
+var isRunning = func() bool {
 	h, _, _ := procOpenMutexW.Call(SYNCHRONIZE, 0, uintptr(unsafe.Pointer(utf16Ptr(mutexName))))
 	if h == 0 {
 		return false
@@ -471,7 +474,7 @@ func runValueExists() bool {
 	return r == 0 && valueType == REG_SZ && size > 2
 }
 
-func setRunValue(command string) error {
+var setRunValue = func(command string) error {
 	const subkey = `Software\Microsoft\Windows\CurrentVersion\Run`
 	var key uintptr
 	r, _, _ := procRegCreateKeyExW.Call(
@@ -498,20 +501,26 @@ func setRunValue(command string) error {
 	return nil
 }
 
-func deleteRunValue() {
+var deleteRunValue = func() error {
 	const subkey = `Software\Microsoft\Windows\CurrentVersion\Run`
 	var key uintptr
-	r, _, _ := procRegCreateKeyExW.Call(
+	r, _, _ := procRegOpenKeyExW.Call(
 		HKEY_CURRENT_USER,
 		uintptr(unsafe.Pointer(utf16Ptr(subkey))),
-		0, 0, 0, KEY_SET_VALUE, 0,
-		uintptr(unsafe.Pointer(&key)), 0,
+		0, KEY_SET_VALUE, uintptr(unsafe.Pointer(&key)),
 	)
+	if r == ERROR_FILE_NOT_FOUND {
+		return nil
+	}
 	if r != 0 {
-		return
+		return syscall.Errno(r)
 	}
 	defer procRegCloseKey.Call(key)
-	procRegDeleteValueW.Call(key, uintptr(unsafe.Pointer(utf16Ptr(runValueName))))
+	r, _, _ = procRegDeleteValueW.Call(key, uintptr(unsafe.Pointer(utf16Ptr(runValueName))))
+	if r != 0 && r != ERROR_FILE_NOT_FOUND {
+		return syscall.Errno(r)
+	}
+	return nil
 }
 
 func removeObsolete(dir string) {
@@ -526,44 +535,74 @@ func removeObsolete(dir string) {
 	_ = os.RemoveAll(filepath.Join(dir, "lockscreen"))
 }
 
-func installWithLaunch(launchMode string, enableAutostart bool) error {
+func installWithLaunch(launchMode string, enableAutostart bool) (result error) {
+	release, lockErr := lockSetupOperation()
+	if lockErr != nil {
+		return lockErr
+	}
+	defer release()
+	started := time.Now()
+	defer func() {
+		appendSetupTrace(fmt.Sprintf("operation=install event=end elapsed_ms=%d error=%v", time.Since(started).Milliseconds(), result))
+	}()
 	if isRunning() {
 		return fmt.Errorf("Wallhaven Rotator est actuellement en cours d'exécution.\n\nQuittez-le d'abord depuis son icône dans la zone de notification (clic droit > Quitter), puis relancez le setup.")
 	}
 
 	dir := appPath()
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	shortcut, err := startMenuShortcutPath()
+	if err != nil {
+		return fmt.Errorf("menu Démarrer: %w", err)
+	}
+	if err = setupPhase("shortcut.validate", func() error { _, e := existingStartMenuShortcut(shortcut, dir); return e }); err != nil {
+		return fmt.Errorf("menu Démarrer: %w", err)
+	}
+	if err := setupPhase("directories", func() error {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return err
+		}
+		if err := os.MkdirAll(filepath.Join(dir, "cache"), 0755); err != nil {
+			return err
+		}
+		if err := os.MkdirAll(filepath.Join(dir, "logs"), 0755); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Join(dir, "cache"), 0755); err != nil {
+	if err := setupPhase("legacy.cleanup", func() error { removeObsolete(dir); return nil }); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Join(dir, "logs"), 0755); err != nil {
-		return err
-	}
-
-	removeObsolete(dir)
 
 	hashes := map[string]string{}
 	for _, item := range payload {
-		data, err := payloadFS.ReadFile("payload/" + item.Name)
-		if err != nil {
-			return fmt.Errorf("lecture payload %s: %w", item.Name, err)
+		if err := setupPhase("payload."+item.Name, func() error {
+			data, err := payloadFS.ReadFile("payload/" + item.Name)
+			if err != nil {
+				return fmt.Errorf("lecture payload %s: %w", item.Name, err)
+			}
+			expected := hashBytes(data)
+			dest := filepath.Join(dir, item.Name)
+			if err := atomicWrite(dest, data); err != nil {
+				return fmt.Errorf("écriture %s: %w", item.Name, err)
+			}
+			diskHash, err := hashFile(dest)
+			if err != nil || !strings.EqualFold(diskHash, expected) {
+				return fmt.Errorf("vérification du fichier installé échouée : %s", item.Name)
+			}
+			hashes[item.Name] = expected
+			return nil
+		}); err != nil {
+			return err
 		}
-		expected := hashBytes(data)
-		dest := filepath.Join(dir, item.Name)
-		if err := atomicWrite(dest, data); err != nil {
-			return fmt.Errorf("écriture %s: %w", item.Name, err)
-		}
-		diskHash, err := hashFile(dest)
-		if err != nil || !strings.EqualFold(diskHash, expected) {
-			return fmt.Errorf("vérification du fichier installé échouée : %s", item.Name)
-		}
-		hashes[item.Name] = expected
 	}
 
-	if err := cleanOldSettings(filepath.Join(dir, "settings.json")); err != nil {
+	if err := setupPhase("settings", func() error { return cleanOldSettings(filepath.Join(dir, "settings.json")) }); err != nil {
 		return fmt.Errorf("settings.json: %w", err)
+	}
+	if err := ensureStartMenuShortcut(dir); err != nil {
+		return fmt.Errorf("menu Démarrer: %w", err)
 	}
 
 	windir := os.Getenv("WINDIR")
@@ -573,12 +612,17 @@ func installWithLaunch(launchMode string, enableAutostart bool) error {
 	wscript := filepath.Join(windir, "System32", "wscript.exe")
 	launcher := filepath.Join(dir, "Wallhaven-Rotator-Launcher.vbs")
 	runCmd := fmt.Sprintf(`"%s" //B //Nologo "%s" autostart`, wscript, launcher)
-	if enableAutostart {
-		if err := setRunValue(runCmd); err != nil {
-			return fmt.Errorf("autostart: %w", err)
+	if err := setupPhase("registry", func() error {
+		if enableAutostart {
+			if err := setRunValue(runCmd); err != nil {
+				return fmt.Errorf("autostart: %w", err)
+			}
+		} else {
+			return deleteRunValue()
 		}
-	} else {
-		deleteRunValue()
+		return nil
+	}); err != nil {
+		return err
 	}
 
 	marker := installMarker{
@@ -587,12 +631,14 @@ func installWithLaunch(launchMode string, enableAutostart bool) error {
 	}
 	b, _ := json.MarshalIndent(marker, "", "  ")
 	b = append(b, '\n')
-	if err := atomicWrite(filepath.Join(dir, "install.json"), b); err != nil {
+	if err := setupPhase("install.json", func() error { return atomicWrite(filepath.Join(dir, "install.json"), b) }); err != nil {
 		return err
 	}
 
 	if launchMode != "" {
-		launchInstalledApp(dir, launchMode)
+		if err := setupPhase("launch.wsh", func() error { return launchInstalledApp(dir, launchMode) }); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -605,19 +651,8 @@ func install() error {
 	return installWithLaunch("show", enableAutostart)
 }
 
-func appendSetupLog(message string) {
-	dir := filepath.Join(appPath(), "logs")
-	_ = os.MkdirAll(dir, 0755)
-	f, err := os.OpenFile(filepath.Join(dir, "update-setup.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-	_, _ = fmt.Fprintf(f, "%s %s\n", time.Now().Format(time.RFC3339), message)
-}
-
 func silentUpdate(enableAutostart bool) error {
-	appendSetupLog("silent update requested: target=" + appVersion)
+	appendSetupTrace("silent update requested: target=" + appVersion)
 
 	deadline := time.Now().Add(20 * time.Second)
 	for isRunning() && time.Now().Before(deadline) {
@@ -625,48 +660,67 @@ func silentUpdate(enableAutostart bool) error {
 	}
 	if isRunning() {
 		err := fmt.Errorf("Wallhaven Rotator did not exit within 20 seconds")
-		appendSetupLog("silent update failed: " + err.Error())
+		appendSetupTrace("silent update failed: " + err.Error())
 		return err
 	}
 
 	if err := installWithLaunch("autostart", enableAutostart); err != nil {
-		appendSetupLog("silent update failed: " + err.Error())
+		appendSetupTrace("silent update failed: " + err.Error())
 		return err
 	}
 
-	appendSetupLog("silent update completed: version=" + appVersion)
+	appendSetupTrace("silent update completed: version=" + appVersion)
 	return nil
 }
 
-func launchInstalledApp(dir, mode string) {
-	windir := os.Getenv("WINDIR")
-	if windir == "" {
-		windir = `C:\Windows`
-	}
-	wscript := filepath.Join(windir, "System32", "wscript.exe")
-	launcher := filepath.Join(dir, "Wallhaven-Rotator-Launcher.vbs")
+var launchInstalledApp = func(dir, mode string) error {
 	if mode == "" {
 		mode = "show"
 	}
-	params := fmt.Sprintf(`//B //Nologo "%s" %s`, launcher, mode)
-	procShellExecuteW.Call(
-		0,
-		uintptr(unsafe.Pointer(utf16Ptr("open"))),
-		uintptr(unsafe.Pointer(utf16Ptr(wscript))),
-		uintptr(unsafe.Pointer(utf16Ptr(params))),
-		uintptr(unsafe.Pointer(utf16Ptr(dir))),
-		SW_SHOWNORMAL,
-	)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	return runWScript(ctx, dir, mode)
 }
 
-func uninstall() error {
+func runWScript(ctx context.Context, dir, mode string) error {
+	wscript := windowsScriptHost()
+	launcher := filepath.Join(dir, "Wallhaven-Rotator-Launcher.vbs")
+	cmd := exec.CommandContext(ctx, wscript, "//B", "//Nologo", launcher, mode)
+	cmd.Dir = dir
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("lancement Wallhaven Rotator: %w (délai: %v)", err, ctx.Err())
+	}
+	return nil
+}
+
+func uninstall() (result error) {
+	release, lockErr := lockSetupOperation()
+	if lockErr != nil {
+		return lockErr
+	}
+	defer release()
+	started := time.Now()
+	defer func() {
+		appendSetupTrace(fmt.Sprintf("operation=uninstall event=end elapsed_ms=%d error=%v", time.Since(started).Milliseconds(), result))
+	}()
 	if isRunning() {
 		return fmt.Errorf("Wallhaven Rotator est actuellement en cours d'exécution.\n\nQuittez-le d'abord depuis son icône dans la zone de notification (clic droit > Quitter), puis relancez le setup pour le désinstaller.")
 	}
-	deleteRunValue()
 	dir := appPath()
-	if err := os.RemoveAll(dir); err != nil {
+	var shortcut []byte
+	err := setupPhase("shortcut.validate", func() error { var e error; shortcut, e = startMenuShortcutForRemoval(dir); return e })
+	if err != nil {
+		return fmt.Errorf("menu Démarrer: %w", err)
+	}
+	if err := setupPhase("registry.remove", deleteRunValue); err != nil {
 		return err
+	}
+	if err := setupPhase("payload.remove", func() error { return os.RemoveAll(dir) }); err != nil {
+		return err
+	}
+	if err := setupPhase("shortcut.remove", func() error { return removeStartMenuShortcut(shortcut) }); err != nil {
+		return fmt.Errorf("menu Démarrer: %w", err)
 	}
 	return nil
 }
@@ -846,12 +900,6 @@ func drawOwnerButton(dis *drawItemStruct) {
 }
 
 func updateUI() {
-	installed = isInstalled()
-	if installed {
-		installedVersion = detectedInstalledVersion()
-	} else {
-		installedVersion = ""
-	}
 	installDir = appPath()
 	if hwndUninstall != 0 {
 		if installed {
@@ -873,7 +921,7 @@ func setBusy(text string) {
 	busyStatus = text
 	enable(hwndInstall, false)
 	enable(hwndUninstall, false)
-	enable(hwndClose, false)
+	enable(hwndClose, true)
 	updateUI()
 	procUpdateWindow.Call(hwndMain)
 }
@@ -889,6 +937,14 @@ func clearBusy() {
 
 func wndProc(hwnd uintptr, m uint32, wparam, lparam uintptr) uintptr {
 	switch m {
+	case wmSetupEvent:
+		receiveSetupEvents(hwnd)
+		return 0
+	case 0x0113: // WM_TIMER: also drains results if PostMessage fails.
+		if wparam == setupTimer {
+			receiveSetupEvents(hwnd)
+			return 0
+		}
 	case WM_PAINT:
 		paintMainWindow(hwnd)
 		return 0
@@ -903,30 +959,19 @@ func wndProc(hwnd uintptr, m uint32, wparam, lparam uintptr) uintptr {
 	case WM_COMMAND:
 		switch loword(wparam) {
 		case ID_INSTALL:
-			setBusy("Installation en cours…")
-			err := install()
-			if err != nil {
-				messageBox(err.Error(), appName+" Setup", MB_OK|MB_ICONERROR)
-			} else {
-				messageBox("Installation terminée.\n\nWallhaven Rotator est prêt et son lancement automatique avec Windows est activé.", appName+" Setup", MB_OK|MB_ICONINFORMATION)
-			}
-			clearBusy()
+			beginSetupOperation(hwnd, false)
 			return 0
 		case ID_UNINSTALL:
-			setBusy("Désinstallation en cours…")
-			err := uninstall()
-			if err != nil {
-				messageBox(err.Error(), appName+" Setup", MB_OK|MB_ICONERROR)
-			} else {
-				messageBox("Wallhaven Rotator a été désinstallé.", appName+" Setup", MB_OK|MB_ICONINFORMATION)
-			}
-			clearBusy()
+			beginSetupOperation(hwnd, true)
 			return 0
 		case ID_CLOSE:
-			procPostQuitMessage.Call(0)
+			requestSetupClose(hwnd)
 			return 0
 		}
-	case WM_CLOSE, WM_DESTROY:
+	case WM_CLOSE:
+		requestSetupClose(hwnd)
+		return 0
+	case WM_DESTROY:
 		procPostQuitMessage.Call(0)
 		return 0
 	}
@@ -966,6 +1011,8 @@ func applyModernWindowAttributes(hwnd uintptr) {
 }
 
 func runGUI() error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	instance, _, _ := procGetModuleHandleW.Call(0)
 	className := utf16Ptr("WallhavenRotatorSetupWindowModern")
 
@@ -1013,6 +1060,21 @@ func runGUI() error {
 		return fmt.Errorf("CreateWindowExW: %v", err)
 	}
 	hwndMain = hwnd
+	setupEvents = make(chan setupEvent, 64)
+	events := setupEvents
+	previousProgress := setupProgress
+	setupProgress = func(phase string) {
+		select {
+		case events <- setupEvent{phase: phase}:
+		default:
+		}
+		user32.NewProc("PostMessageW").Call(hwnd, wmSetupEvent, 0, 0)
+	}
+	defer func() { setupProgress = previousProgress }()
+	installed = isInstalled()
+	if installed {
+		installedVersion = detectedInstalledVersion()
+	}
 
 	if appIcon != 0 {
 		procSendMessageW.Call(hwnd, WM_SETICON, ICON_BIG, appIcon)

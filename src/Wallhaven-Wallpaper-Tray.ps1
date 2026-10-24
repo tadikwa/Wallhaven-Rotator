@@ -21,6 +21,7 @@ if (-not (Test-Path $SharedPolicyPath)) {
     throw "Module Wallhaven-SharedPolicy.ps1 introuvable."
 }
 . $SharedPolicyPath
+. (Join-Path $PSScriptRoot 'Wallhaven-Desktop.ps1')
 
 try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -586,6 +587,16 @@ function Refresh-SharedHistoryView {
         [void]$list.Add([string]$entry.Key)
     }
     $script:HistoryIds = $list
+}
+
+function Get-SelectionHistorySnapshot {
+    $today = (Get-SharedHistoryNow).LocalDateTime.Date
+    if (-not $script:SelectionHistorySnapshot -or $script:SelectionHistoryDate -ne $today) {
+        $script:SelectionHistorySnapshot = Get-SharedHistorySnapshot
+        $script:SelectionHistoryDate = $today
+        $script:SelectionHistoryReads++
+    }
+    return $script:SelectionHistorySnapshot
 }
 
 function Save-WallpaperHistory {
@@ -1254,17 +1265,10 @@ function Invoke-SilentUpdate {
         Write-Log "INFO" "Lancement mise à jour silencieuse : $($script:UpdateReadyPath) ; $autostartArg"
         Start-Process `
             -FilePath $script:UpdateReadyPath `
+            -WindowStyle Hidden `
             -ArgumentList @("--silent-update", $autostartArg)
 
-        $script:Exiting = $true
-        try { $script:Timer.Stop() } catch {}
-        try { $notifyIcon.Visible = $false; $notifyIcon.Dispose() } catch {}
-        try { if ($script:TrayIconObject) { $script:TrayIconObject.Dispose() } } catch {}
-        try { $script:HttpClient.Dispose() } catch {}
-        try { $handler.Dispose() } catch {}
-        try { $script:Mutex.ReleaseMutex(); $script:Mutex.Dispose() } catch {}
-        try { $window.Close() } catch {}
-        [System.Windows.Application]::Current.Shutdown()
+        Request-DesktopExit
     }
     catch {
         Write-Log "ERROR" "Lancement de la mise à jour impossible : $(Get-DeepErrorMessage $_)"
@@ -1431,7 +1435,6 @@ try {
 } catch {}
 
 $script:Settings = Load-Settings
-Load-MetadataCache
 $script:Running = [bool]$script:Settings.autoRotation
 $script:NextChange = $null
 $script:State = "Idle"
@@ -1465,7 +1468,7 @@ $script:PagesTried = @()
 $script:PageCeilings = @{}
 $script:ApiQueryKey = $null
 $script:PendingManual = $false
-$script:HistoryIds = Load-WallpaperHistory
+$script:HistoryIds = New-Object 'System.Collections.Generic.List[string]'
 if ($null -eq $script:HistoryIds) {
     # Should not happen after Load-WallpaperHistory's -NoEnumerate return,
     # but keep startup resilient to future changes.
@@ -1487,22 +1490,7 @@ $script:UpdateNotifiedVersion = [string]$script:Settings.lastNotifiedUpdate
 $script:NextUpdateCheck = [DateTime]::Now.AddSeconds(5)
 
 [xml]$xaml = @'
-<Window
-    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-    Title="Wallhaven Rotator"
-    Width="560"
-    SizeToContent="Height"
-    MinHeight="430"
-    MaxHeight="900"
-    WindowStartupLocation="CenterScreen"
-    WindowStyle="None"
-    ResizeMode="NoResize"
-    Background="#22282C"
-    Foreground="#F4F7F5"
-    FontFamily="Segoe UI"
-    ShowInTaskbar="False">
-
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Title="Wallhaven Rotator" Width="560" SizeToContent="Manual" MinHeight="0" WindowStartupLocation="CenterScreen" WindowStyle="None" ResizeMode="NoResize" Background="#22282C" Foreground="#F4F7F5" FontFamily="Segoe UI" ShowInTaskbar="True" Height="560">
     <Window.Resources>
         <SolidColorBrush x:Key="Accent" Color="#71D69A"/>
         <SolidColorBrush x:Key="AccentDim" Color="#3B8059"/>
@@ -1510,7 +1498,6 @@ $script:NextUpdateCheck = [DateTime]::Now.AddSeconds(5)
         <SolidColorBrush x:Key="Panel2" Color="#30383D"/>
         <SolidColorBrush x:Key="Stroke" Color="#465158"/>
         <SolidColorBrush x:Key="Muted" Color="#A8B1B5"/>
-
         <Style TargetType="Button">
             <Setter Property="Foreground" Value="#F4F7F5"/>
             <Setter Property="Background" Value="#343D42"/>
@@ -1519,248 +1506,145 @@ $script:NextUpdateCheck = [DateTime]::Now.AddSeconds(5)
             <Setter Property="Padding" Value="13,8"/>
             <Setter Property="Cursor" Value="Hand"/>
         </Style>
-
         <Style TargetType="ComboBox">
             <Setter Property="MinHeight" Value="32"/>
             <Setter Property="Padding" Value="8,3"/>
         </Style>
-
         <Style TargetType="TextBox">
             <Setter Property="MinHeight" Value="32"/>
             <Setter Property="Padding" Value="8,5"/>
         </Style>
-
         <Style TargetType="CheckBox">
             <Setter Property="Foreground" Value="#F4F7F5"/>
         </Style>
     </Window.Resources>
-
-    <Border BorderBrush="#4C585E"
-            BorderThickness="1"
-            CornerRadius="12"
-            Background="#22282C">
+    <Border BorderBrush="#4C585E" BorderThickness="1" CornerRadius="12" Background="#22282C">
         <Grid>
             <Grid.RowDefinitions>
                 <RowDefinition Height="48"/>
                 <RowDefinition Height="*"/>
             </Grid.RowDefinitions>
-
-            <Grid x:Name="DragSurface"
-                  Grid.Row="0"
-                  Background="#252C30">
+            <Grid x:Name="DragSurface" Grid.Row="0" Background="#252C30">
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*"/>
                     <ColumnDefinition Width="42"/>
                 </Grid.ColumnDefinitions>
-
-                <StackPanel Orientation="Horizontal"
-                            VerticalAlignment="Center"
-                            Margin="16,0,0,0">
-                    <Ellipse Width="9"
-                             Height="9"
-                             Fill="{StaticResource Accent}"
-                             Margin="0,0,9,0"/>
-                    <TextBlock Text="Wallhaven Rotator"
-                               FontWeight="SemiBold"
-                               FontSize="15"
-                               VerticalAlignment="Center"/>
-                    <TextBlock x:Name="VersionText" Text="v1.1.0"
-                               Foreground="{StaticResource Muted}"
-                               FontSize="11"
-                               Margin="9,2,0,0"
-                               VerticalAlignment="Center"/>
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="16,0,0,0">
+                    <Ellipse Width="9" Height="9" Fill="{StaticResource Accent}" Margin="0,0,9,0"/>
+                    <TextBlock Text="Wallhaven Rotator" FontWeight="SemiBold" FontSize="15" VerticalAlignment="Center"/>
+                    <TextBlock x:Name="VersionText" Text="v1.1.0" Foreground="{StaticResource Muted}" FontSize="11" Margin="9,2,0,0" VerticalAlignment="Center"/>
                 </StackPanel>
-
-                <Button x:Name="HideButton"
-                        Grid.Column="1"
-                        Content="×"
-                        FontSize="18"
-                        Padding="0"
-                        Background="Transparent"
-                        BorderThickness="0"/>
+                <Button x:Name="HideButton" Grid.Column="1" Content="×" FontSize="18" Padding="0" Background="Transparent" BorderThickness="0"/>
             </Grid>
-
-            <StackPanel Grid.Row="1"
-                        Margin="18">
-
-                <Border Background="{StaticResource Panel}"
-                        BorderBrush="{StaticResource Stroke}"
-                        BorderThickness="1"
-                        CornerRadius="10"
-                        Padding="14">
-                    <Grid>
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="*"/>
-                            <ColumnDefinition Width="Auto"/>
-                        </Grid.ColumnDefinitions>
-
-                        <StackPanel>
-                            <StackPanel Orientation="Horizontal">
-                                <Ellipse x:Name="StateDot"
-                                         Width="9"
-                                         Height="9"
-                                         Fill="{StaticResource Accent}"
-                                         Margin="0,5,8,0"/>
-                                <TextBlock x:Name="StateText"
-                                           Text="Actif"
-                                           FontWeight="SemiBold"
-                                           FontSize="14"/>
-                            </StackPanel>
-
-                            <TextBlock x:Name="StatusText"
-                                       Text="Initialisation..."
-                                       Foreground="{StaticResource Muted}"
-                                       FontSize="11.5"
-                                       TextWrapping="Wrap"
-                                       Margin="17,5,0,0"/>
+            <Grid x:Name="ResponsiveGrid" Grid.Row="1">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="0"/>
+                </Grid.ColumnDefinitions>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="*"/>
+                    <RowDefinition Height="0"/>
+                </Grid.RowDefinitions>
+                <Grid x:Name="MainPanel">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="*"/>
+                        <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+                    <ScrollViewer x:Name="MainScrollViewer" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                        <StackPanel Margin="18,18,18,0">
+                            <Border Background="{StaticResource Panel}" BorderBrush="{StaticResource Stroke}" BorderThickness="1" CornerRadius="10" Padding="14">
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <StackPanel>
+                                        <StackPanel Orientation="Horizontal">
+                                            <Ellipse x:Name="StateDot" Width="9" Height="9" Fill="{StaticResource Accent}" Margin="0,5,8,0"/>
+                                            <TextBlock x:Name="StateText" Text="Actif" FontWeight="SemiBold" FontSize="14"/>
+                                        </StackPanel>
+                                        <TextBlock x:Name="StatusText" Text="Initialisation..." Foreground="{StaticResource Muted}" FontSize="11.5" TextWrapping="Wrap" Margin="17,5,0,0"/>
+                                    </StackPanel>
+                                    <TextBlock x:Name="NextChangeText" Grid.Column="1" Foreground="{StaticResource Muted}" FontSize="11" VerticalAlignment="Center" Margin="15,0,0,0"/>
+                                </Grid>
+                            </Border>
+                            <Border x:Name="UpdateBanner" Visibility="Collapsed" Background="#24372E" BorderBrush="#478463" BorderThickness="1" CornerRadius="9" Padding="12" Margin="0,10,0,0">
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <StackPanel>
+                                        <TextBlock x:Name="UpdateBannerTitle" Text="Mise à jour disponible" FontWeight="SemiBold" Foreground="#A9E9C3"/>
+                                        <TextBlock x:Name="UpdateBannerText" Text="Une nouvelle version est disponible." Foreground="{StaticResource Muted}" FontSize="10.5" Margin="0,3,8,0" TextWrapping="Wrap"/>
+                                    </StackPanel>
+                                    <Button x:Name="UpdateActionButton" Grid.Column="1" Content="Mettre à jour" Padding="12,6" VerticalAlignment="Center"/>
+                                </Grid>
+                            </Border>
+                            <Grid Margin="0,15,0,0">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="12"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <StackPanel Grid.Column="0">
+                                    <TextBlock Text="Sélection" Foreground="{StaticResource Muted}" FontSize="11" Margin="1,0,0,5"/>
+                                    <ComboBox x:Name="SortCombo"/>
+                                </StackPanel>
+                                <StackPanel Grid.Column="2">
+                                    <TextBlock Text="Catégorie" Foreground="{StaticResource Muted}" FontSize="11" Margin="1,0,0,5"/>
+                                    <ComboBox x:Name="CategoryCombo"/>
+                                </StackPanel>
+                            </Grid>
+                            <Grid Margin="0,13,0,0">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="12"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <StackPanel Grid.Column="0">
+                                    <TextBlock Text="Changer toutes les" Foreground="{StaticResource Muted}" FontSize="11" Margin="1,0,0,5"/>
+                                    <TextBox x:Name="IntervalText"/>
+                                </StackPanel>
+                                <StackPanel Grid.Column="2">
+                                    <TextBlock Text="Unité" Foreground="{StaticResource Muted}" FontSize="11" Margin="1,0,0,5"/>
+                                    <ComboBox x:Name="UnitCombo"/>
+                                </StackPanel>
+                            </Grid>
+                            <CheckBox x:Name="AutoRotationCheck" Content="Rotation automatique" Margin="1,14,0,0" IsChecked="True"/>
                         </StackPanel>
-
-                        <TextBlock x:Name="NextChangeText"
-                                   Grid.Column="1"
-                                   Foreground="{StaticResource Muted}"
-                                   FontSize="11"
-                                   VerticalAlignment="Center"
-                                   Margin="15,0,0,0"/>
-                    </Grid>
-                </Border>
-
-                <Border x:Name="UpdateBanner"
-                        Visibility="Collapsed"
-                        Background="#24372E"
-                        BorderBrush="#478463"
-                        BorderThickness="1"
-                        CornerRadius="9"
-                        Padding="12"
-                        Margin="0,10,0,0">
-                    <Grid>
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="*"/>
-                            <ColumnDefinition Width="Auto"/>
-                        </Grid.ColumnDefinitions>
+                    </ScrollViewer>
+                    <StackPanel x:Name="MainFooter" Grid.Row="1" Margin="18,8,18,10">
+                        <Grid Margin="0">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="10"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+                            <Button x:Name="ChangeNowButton" Grid.Column="0" Content="Changer maintenant"/>
+                            <Button x:Name="PauseButton" Grid.Column="2" Content="Mettre en pause"/>
+                        </Grid>
+                        <Expander x:Name="AdvancedExpander" Header="Options" Margin="0,15,0,0" Foreground="#F4F7F5"/>
+                        <Grid Margin="0,16,0,0">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="10"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+                            <Button x:Name="SaveButton" Grid.Column="0" Content="Enregistrer"/>
+                            <Button x:Name="CloseButton" Grid.Column="2" Content="Fermer"/>
+                        </Grid>
+                        <TextBlock Text="Wallhaven public · SFW uniquement · aucun droit administrateur" Foreground="#758087" FontSize="10" HorizontalAlignment="Center" Margin="0,13,0,0"/>
+                    </StackPanel>
+                </Grid>
+                <ScrollViewer x:Name="OptionsScrollViewer" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" PanningMode="VerticalOnly" Visibility="Collapsed" Margin="0,0,12,12">
+                    <Border Background="{StaticResource Panel2}" BorderBrush="{StaticResource Stroke}" BorderThickness="1" CornerRadius="9" Padding="13" Margin="0,8,0,0">
                         <StackPanel>
-                            <TextBlock x:Name="UpdateBannerTitle"
-                                       Text="Mise à jour disponible"
-                                       FontWeight="SemiBold"
-                                       Foreground="#A9E9C3"/>
-                            <TextBlock x:Name="UpdateBannerText"
-                                       Text="Une nouvelle version est disponible."
-                                       Foreground="{StaticResource Muted}"
-                                       FontSize="10.5"
-                                       Margin="0,3,8,0"
-                                       TextWrapping="Wrap"/>
-                        </StackPanel>
-                        <Button x:Name="UpdateActionButton"
-                                Grid.Column="1"
-                                Content="Mettre à jour"
-                                Padding="12,6"
-                                VerticalAlignment="Center"/>
-                    </Grid>
-                </Border>
-
-                <Grid Margin="0,15,0,0">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*"/>
-                        <ColumnDefinition Width="12"/>
-                        <ColumnDefinition Width="*"/>
-                    </Grid.ColumnDefinitions>
-
-                    <StackPanel Grid.Column="0">
-                        <TextBlock Text="Sélection"
-                                   Foreground="{StaticResource Muted}"
-                                   FontSize="11"
-                                   Margin="1,0,0,5"/>
-                        <ComboBox x:Name="SortCombo"/>
-                    </StackPanel>
-
-                    <StackPanel Grid.Column="2">
-                        <TextBlock Text="Catégorie"
-                                   Foreground="{StaticResource Muted}"
-                                   FontSize="11"
-                                   Margin="1,0,0,5"/>
-                        <ComboBox x:Name="CategoryCombo"/>
-                    </StackPanel>
-                </Grid>
-
-                <Grid Margin="0,13,0,0">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*"/>
-                        <ColumnDefinition Width="12"/>
-                        <ColumnDefinition Width="*"/>
-                    </Grid.ColumnDefinitions>
-
-                    <StackPanel Grid.Column="0">
-                        <TextBlock Text="Changer toutes les"
-                                   Foreground="{StaticResource Muted}"
-                                   FontSize="11"
-                                   Margin="1,0,0,5"/>
-                        <TextBox x:Name="IntervalText"/>
-                    </StackPanel>
-
-                    <StackPanel Grid.Column="2">
-                        <TextBlock Text="Unité"
-                                   Foreground="{StaticResource Muted}"
-                                   FontSize="11"
-                                   Margin="1,0,0,5"/>
-                        <ComboBox x:Name="UnitCombo"/>
-                    </StackPanel>
-                </Grid>
-
-                <CheckBox x:Name="AutoRotationCheck"
-                          Content="Rotation automatique"
-                          Margin="1,14,0,0"
-                          IsChecked="True"/>
-
-                <Grid Margin="0,14,0,0">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*"/>
-                        <ColumnDefinition Width="10"/>
-                        <ColumnDefinition Width="*"/>
-                    </Grid.ColumnDefinitions>
-
-                    <Button x:Name="ChangeNowButton"
-                            Grid.Column="0"
-                            Content="Changer maintenant"/>
-
-                    <Button x:Name="PauseButton"
-                            Grid.Column="2"
-                            Content="Mettre en pause"/>
-                </Grid>
-
-                <Expander x:Name="AdvancedExpander"
-                          Header="Options"
-                          Margin="0,15,0,0"
-                          Foreground="#F4F7F5">
-                    <ScrollViewer x:Name="OptionsScrollViewer"
-                                  VerticalScrollBarVisibility="Auto"
-                                  HorizontalScrollBarVisibility="Disabled"
-                                  PanningMode="VerticalOnly">
-                    <Border Background="{StaticResource Panel2}"
-                            BorderBrush="{StaticResource Stroke}"
-                            BorderThickness="1"
-                            CornerRadius="9"
-                            Padding="13"
-                            Margin="0,8,0,0">
-                        <StackPanel>
-                            <CheckBox x:Name="RunAtLogonCheck"
-                                      Content="Lancer automatiquement avec Windows"/>
-
-                            <TextBlock Text="Le démarrage utilise un lanceur silencieux : aucune fenêtre PowerShell ne doit rester ouverte."
-                                       Foreground="{StaticResource Muted}"
-                                       FontSize="10.5"
-                                       TextWrapping="Wrap"
-                                       Margin="22,6,0,0"/>
-
-                            <Border Background="#293238"
-                                    BorderBrush="{StaticResource Stroke}"
-                                    BorderThickness="1"
-                                    CornerRadius="8"
-                                    Padding="10"
-                                    Margin="0,12,0,0">
+                            <CheckBox x:Name="RunAtLogonCheck" Content="Lancer automatiquement avec Windows"/>
+                            <TextBlock Text="Le démarrage utilise un lanceur silencieux : aucune fenêtre PowerShell ne doit rester ouverte." Foreground="{StaticResource Muted}" FontSize="10.5" TextWrapping="Wrap" Margin="22,6,0,0"/>
+                            <Border Background="#293238" BorderBrush="{StaticResource Stroke}" BorderThickness="1" CornerRadius="8" Padding="10" Margin="0,12,0,0">
                                 <StackPanel>
-                                    <TextBlock Text="AFFICHAGE"
-                                               Foreground="{StaticResource Accent}"
-                                               FontWeight="SemiBold"
-                                               FontSize="10"/>
+                                    <TextBlock Text="AFFICHAGE" Foreground="{StaticResource Accent}" FontWeight="SemiBold" FontSize="10"/>
                                     <Grid Margin="0,8,0,0">
                                         <Grid.ColumnDefinitions>
                                             <ColumnDefinition Width="*"/>
@@ -1800,25 +1684,12 @@ $script:NextUpdateCheck = [DateTime]::Now.AddSeconds(5)
                                             <ComboBox x:Name="CustomRatioCombo"/>
                                         </StackPanel>
                                     </Grid>
-                                    <TextBlock x:Name="ResolutionInfoText"
-                                               Foreground="{StaticResource Muted}"
-                                               FontSize="10.5"
-                                               Margin="0,7,0,0"
-                                               TextWrapping="Wrap"/>
+                                    <TextBlock x:Name="ResolutionInfoText" Foreground="{StaticResource Muted}" FontSize="10.5" Margin="0,7,0,0" TextWrapping="Wrap"/>
                                 </StackPanel>
                             </Border>
-
-                            <Border Background="#293238"
-                                    BorderBrush="{StaticResource Stroke}"
-                                    BorderThickness="1"
-                                    CornerRadius="8"
-                                    Padding="10"
-                                    Margin="0,9,0,0">
+                            <Border Background="#293238" BorderBrush="{StaticResource Stroke}" BorderThickness="1" CornerRadius="8" Padding="10" Margin="0,9,0,0">
                                 <StackPanel>
-                                    <TextBlock Text="CONTENU WALLHAVEN"
-                                               Foreground="{StaticResource Accent}"
-                                               FontWeight="SemiBold"
-                                               FontSize="10"/>
+                                    <TextBlock Text="CONTENU WALLHAVEN" Foreground="{StaticResource Accent}" FontWeight="SemiBold" FontSize="10"/>
                                     <Grid Margin="0,8,0,0">
                                         <Grid.ColumnDefinitions>
                                             <ColumnDefinition Width="*"/>
@@ -1834,102 +1705,34 @@ $script:NextUpdateCheck = [DateTime]::Now.AddSeconds(5)
                                             <TextBox x:Name="QueryText"/>
                                         </StackPanel>
                                     </Grid>
-                                    <TextBlock Text="Strict est volontairement conservateur et utilise les tags/métadonnées Wallhaven ; il ne s'agit pas de reconnaissance d'image."
-                                               Foreground="{StaticResource Muted}"
-                                               FontSize="10"
-                                               TextWrapping="Wrap"
-                                               Margin="0,7,0,0"/>
+                                    <TextBlock Text="Strict est volontairement conservateur et utilise les tags/métadonnées Wallhaven ; il ne s'agit pas de reconnaissance d'image." Foreground="{StaticResource Muted}" FontSize="10" TextWrapping="Wrap" Margin="0,7,0,0"/>
                                 </StackPanel>
                             </Border>
-
-                            <Border Background="#293238"
-                                    BorderBrush="{StaticResource Stroke}"
-                                    BorderThickness="1"
-                                    CornerRadius="8"
-                                    Padding="10"
-                                    Margin="0,9,0,0">
+                            <Border Background="#293238" BorderBrush="{StaticResource Stroke}" BorderThickness="1" CornerRadius="8" Padding="10" Margin="0,9,0,0">
                                 <StackPanel>
-                                    <TextBlock Text="MISES À JOUR"
-                                               Foreground="{StaticResource Accent}"
-                                               FontWeight="SemiBold"
-                                               FontSize="10"/>
-                                    <CheckBox x:Name="CheckUpdatesCheck"
-                                              Content="Vérifier automatiquement les nouvelles versions"
-                                              Margin="0,8,0,0"/>
-                                    <CheckBox x:Name="AutoUpdateCheck"
-                                              Content="Installer automatiquement les mises à jour"
-                                              Margin="0,6,0,0"/>
-                                    <TextBlock x:Name="UpdateStateText"
-                                               Text="Version installée"
-                                               Foreground="{StaticResource Muted}"
-                                               FontSize="10.5"
-                                               Margin="22,6,0,0"/>
-                                    <Button x:Name="CheckUpdateNowButton"
-                                            Content="Vérifier maintenant"
-                                            Margin="0,9,0,0"/>
+                                    <TextBlock Text="MISES À JOUR" Foreground="{StaticResource Accent}" FontWeight="SemiBold" FontSize="10"/>
+                                    <CheckBox x:Name="CheckUpdatesCheck" Content="Vérifier automatiquement les nouvelles versions" Margin="0,8,0,0"/>
+                                    <CheckBox x:Name="AutoUpdateCheck" Content="Installer automatiquement les mises à jour" Margin="0,6,0,0"/>
+                                    <TextBlock x:Name="UpdateStateText" Text="Version installée" Foreground="{StaticResource Muted}" FontSize="10.5" Margin="22,6,0,0"/>
+                                    <Button x:Name="CheckUpdateNowButton" Content="Vérifier maintenant" Margin="0,9,0,0"/>
                                 </StackPanel>
                             </Border>
-
-                            <TextBlock x:Name="AntiRepeatStatsText"
-                                       Text="Anti-répétition : initialisation…"
-                                       Foreground="{StaticResource Muted}"
-                                       FontSize="10.5"
-                                       TextWrapping="Wrap"
-                                       Margin="22,8,0,0"/>
-
-                            <TextBlock Text="Cache local borné : 50 images maximum et 500 MiB maximum."
-                                       Foreground="{StaticResource Muted}"
-                                       FontSize="10.5"
-                                       TextWrapping="Wrap"
-                                       Margin="22,5,0,0"/>
-
+                            <TextBlock x:Name="AntiRepeatStatsText" Text="Anti-répétition : initialisation…" Foreground="{StaticResource Muted}" FontSize="10.5" TextWrapping="Wrap" Margin="22,8,0,0"/>
+                            <TextBlock Text="Cache local borné : 50 images maximum et 500 MiB maximum." Foreground="{StaticResource Muted}" FontSize="10.5" TextWrapping="Wrap" Margin="22,5,0,0"/>
                             <Grid Margin="0,12,0,0">
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width="*"/>
                                     <ColumnDefinition Width="8"/>
                                     <ColumnDefinition Width="*"/>
                                 </Grid.ColumnDefinitions>
-
-                                <Button x:Name="OpenLogsButton"
-                                        Grid.Column="0"
-                                        Content="Ouvrir les logs"/>
-
-                                <Button x:Name="OpenFolderButton"
-                                        Grid.Column="2"
-                                        Content="Dossier de l'app"/>
+                                <Button x:Name="OpenLogsButton" Grid.Column="0" Content="Ouvrir les logs"/>
+                                <Button x:Name="OpenFolderButton" Grid.Column="2" Content="Dossier de l'app"/>
                             </Grid>
-
-                            <Button x:Name="CurrentWallpaperButton"
-                                    Content="Voir le fond actuel sur Wallhaven"
-                                    Margin="0,8,0,0"
-                                    IsEnabled="False"/>
+                            <Button x:Name="CurrentWallpaperButton" Content="Voir le fond actuel sur Wallhaven" Margin="0,8,0,0" IsEnabled="False"/>
                         </StackPanel>
                     </Border>
-                    </ScrollViewer>
-                </Expander>
-
-                <Grid Margin="0,16,0,0">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*"/>
-                        <ColumnDefinition Width="10"/>
-                        <ColumnDefinition Width="*"/>
-                    </Grid.ColumnDefinitions>
-
-                    <Button x:Name="SaveButton"
-                            Grid.Column="0"
-                            Content="Enregistrer"/>
-
-                    <Button x:Name="CloseButton"
-                            Grid.Column="2"
-                            Content="Fermer"/>
-                </Grid>
-
-                <TextBlock Text="Wallhaven public · SFW uniquement · aucun droit administrateur"
-                           Foreground="#758087"
-                           FontSize="10"
-                           HorizontalAlignment="Center"
-                           Margin="0,13,0,0"/>
-            </StackPanel>
+                </ScrollViewer>
+            </Grid>
         </Grid>
     </Border>
 </Window>
@@ -2009,33 +1812,7 @@ function Set-Status {
 }
 
 function Update-OptionsViewport {
-    try {
-        $workArea = [System.Windows.SystemParameters]::WorkArea
-
-        # Keep a small visible margin around the window and let only the
-        # variable Options content scroll when vertical room is limited.
-        $maxWindowHeight = [math]::Max(
-            460.0,
-            [double]$workArea.Height - 20.0
-        )
-
-        $window.MaxHeight = $maxWindowHeight
-
-        # Roughly 500 DIPs are occupied by the title bar, main controls,
-        # Options header, action buttons and footer. The remainder belongs
-        # to the scrollable Options body.
-        $optionsHeight = [math]::Max(
-            140.0,
-            $maxWindowHeight - 500.0
-        )
-
-        $OptionsScrollViewer.MaxHeight = $optionsHeight
-    }
-    catch {
-        # Conservative fallback for unusual display/DPI environments.
-        $window.MaxHeight = 900
-        $OptionsScrollViewer.MaxHeight = 380
-    }
+    Set-WallhavenWindowViewport -Window $window -Options ([bool]$AdvancedExpander.IsExpanded)
 }
 
 function Refresh-ResolutionUi {
@@ -2168,6 +1945,7 @@ function Save-UiSettings {
     $script:Settings.unit = [string]$UnitCombo.SelectedItem
     $script:Settings.autoRotation = [bool]$AutoRotationCheck.IsChecked
     $script:Settings.resolutionMode = [string]$ResolutionModeCombo.SelectedItem
+    if($script:SelectionWorker -and $script:SelectionWorker.Async) { Stop-WallhavenWorkerJob -Worker $script:SelectionWorker }
     $script:Settings.resolutionMatch = [string]$ResolutionMatchCombo.SelectedItem
     $script:Settings.customWidth = $customWidth
     $script:Settings.customHeight = $customHeight
@@ -2205,47 +1983,33 @@ function Save-UiSettings {
 }
 
 function Refresh-DiagnosticsUi {
-    try {
-        $snapshot = Get-SharedHistorySnapshot
-        $cacheCount = @(
-            Get-ChildItem -Path $CacheDir -File -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -like "wallhaven-*" }
-        ).Count
-
-        $AntiRepeatStatsText.Text = (
-            "Anti-répétition globale : aujourd'hui={0} · historique={1}/{2} · cache={3} · rejets jour={4} · récents={5} · pending={6} · Strict={7}" -f
-            $snapshot.SeenTodayCount,
-            $snapshot.HistoryCount,
-            $HistoryMaxIds,
-            $cacheCount,
-            [int]$script:CandidateDiagnostics.daily,
-            [int]$script:CandidateDiagnostics.recent,
-            [int]$script:CandidateDiagnostics.pending,
-            [int]$script:CandidateDiagnostics.strict
-        )
-    }
-    catch {
-        $AntiRepeatStatsText.Text = "Anti-répétition globale : diagnostic indisponible."
-    }
+    $data=$script:DesktopDiagnostics
+    if(-not $data) { $AntiRepeatStatsText.Text='Anti-répétition globale : initialisation du worker...'; return }
+    $AntiRepeatStatsText.Text=("Anti-répétition globale : aujourd'hui={0} · historique={1}/{2} · cache={3}" -f $data.todayCount,$data.historyCount,$HistoryMaxIds,$data.cacheCount)
 }
 
 function Show-SettingsWindow {
     Sync-UiFromSettings
     Refresh-DiagnosticsUi
-    Update-OptionsViewport
-    $window.ShowInTaskbar = $true
-    $window.Show()
-    $window.WindowState = [System.Windows.WindowState]::Normal
-    $window.Activate()
+    Show-WallhavenWindow -Window $window -IconPath $IconPath
 }
 
 function Hide-SettingsWindow {
-    $window.Hide()
-    $window.ShowInTaskbar = $false
+    Hide-WallhavenWindow -Window $window
 }
 
-$AdvancedExpander.Add_Expanded({
-    Update-OptionsViewport
+$AdvancedExpander.Add_Expanded({ Update-OptionsViewport })
+$AdvancedExpander.Add_Collapsed({ Update-OptionsViewport })
+$window.Add_LocationChanged({ if($window.IsVisible) { Update-OptionsViewport } })
+$window.Add_SourceInitialized({
+    $source=[Windows.Interop.HwndSource]::FromHwnd(([Windows.Interop.WindowInteropHelper]::new($window)).Handle)
+    $source.AddHook([Windows.Interop.HwndSourceHook]{
+        param($hwnd,$message,$wparam,$lparam,[ref]$handled)
+        if($message -eq 0x02E0 -or $message -eq 0x007E -or $message -eq 0x001A) {
+            [void]$window.Dispatcher.BeginInvoke([Action]{ Update-OptionsViewport })
+        }
+        return [IntPtr]::Zero
+    })
 })
 
 $ResolutionModeCombo.Add_SelectionChanged({
@@ -2308,14 +2072,7 @@ $DragSurface.Add_MouseLeftButtonDown({
 $HideButton.Add_Click({ Hide-SettingsWindow })
 $CloseButton.Add_Click({ Hide-SettingsWindow })
 
-$window.Add_Closing({
-    param($sender, $e)
-
-    if (-not $script:Exiting) {
-        $e.Cancel = $true
-        Hide-SettingsWindow
-    }
-})
+Register-WallhavenWindowLifecycle -Window $window
 
 # Systray.
 $trayMenu = New-Object System.Windows.Forms.ContextMenuStrip
@@ -2390,6 +2147,9 @@ $notifyIcon.Visible = $true
 function Initialize-SelectionCycle {
     Stop-SelectionRequests
     $script:SelectionCancellation = New-Object Threading.CancellationTokenSource
+    $script:SelectionHistorySnapshot = $null
+    $script:SelectionHistoryReads = 0
+    $script:SelectionClock = [Diagnostics.Stopwatch]::StartNew()
     $script:SelectionSearches = 0
     $script:MetadataChecks = 0
     $script:SelectionSeenIds = @{}
@@ -2418,7 +2178,8 @@ function Write-SelectionSummary {
     $script:SelectionSummaryWritten = $true
     $s = $script:SelectionStats
     $rejected = @($s.rejected.Keys | Sort-Object | ForEach-Object { "$_=$($s.rejected[$_])" }) -join ','
-    Write-Log 'INFO' ("selection.summary outcome=$Outcome search=$($s.searches) metadata=$($s.metadata) metadata_cache=$($s.metadataHits) search_cache=$($s.searchHits) local=$($s.localHits) elapsed_ms=$([math]::Round(((Get-SharedHistoryNow)-$s.started).TotalMilliseconds)) rejected=[$rejected] samples=[$($s.samples -join ',')]")
+    $realMs = if ($script:SelectionClock) { [math]::Round($script:SelectionClock.Elapsed.TotalMilliseconds) } else { 0 }
+    Write-Log 'INFO' ("selection.summary outcome=$Outcome search=$($s.searches) metadata=$($s.metadata) metadata_cache=$($s.metadataHits) search_cache=$($s.searchHits) local=$($s.localHits) elapsed_ms=$([math]::Round(((Get-SharedHistoryNow)-$s.started).TotalMilliseconds)) real_elapsed_ms=$realMs history_reads=$script:SelectionHistoryReads rejected=[$rejected] samples=[$($s.samples -join ',')]")
 }
 
 function Load-SearchCache {
@@ -2497,6 +2258,10 @@ function Start-WallhavenApiTask {
         ($Kind -eq 'Metadata' -and $script:MetadataChecks -ge $MetadataChecksPerSelection) -or
         (Get-SharedHistoryNow) -gt $script:SelectionDeadline) {
         Finish-NoEligibleCandidate -Reason 'budget total de sélection épuisé'
+        return
+    }
+    if ($script:WorkerCancellation -and $script:WorkerCancellation.IsCancellationRequested) {
+        Finish-NoEligibleCandidate -Reason 'sélection annulée'
         return
     }
     if ($Kind -ne 'Download') {
@@ -2615,7 +2380,7 @@ function Get-WallhavenResponseJson {
 function Get-EligibleCandidates {
     param([object[]]$Data)
 
-    $snapshot = Get-SharedHistorySnapshot
+    $snapshot = Get-SelectionHistorySnapshot
     $target = Get-TargetDisplayFilter
     $seenLocal = @{}
     $accepted = New-Object System.Collections.Generic.List[object]
@@ -2865,6 +2630,10 @@ function Begin-CandidateDownload {
 function Begin-CandidateEvaluation {
     $budgetExhausted = $false
     while (@($script:CandidateQueue).Count -gt 0) {
+        if ($script:WorkerCancellation -and $script:WorkerCancellation.IsCancellationRequested) {
+            Finish-NoEligibleCandidate -Reason 'sélection annulée'
+            return
+        }
         $candidate = $script:CandidateQueue[0]
         if ($script:CandidateQueue.Count -gt 1) {
             $script:CandidateQueue = @($script:CandidateQueue[1..($script:CandidateQueue.Count - 1)])
@@ -3045,6 +2814,10 @@ function Complete-Wallpaper {
 
     $id = [string]$Candidate.id
     try {
+        if ($script:WorkerCancellation -and $script:WorkerCancellation.IsCancellationRequested) {
+            Finish-NoEligibleCandidate -Reason 'sélection annulée'
+            return
+        }
         if ((Get-SharedHistoryNow) -gt $script:SelectionDeadline) {
             Finish-NoEligibleCandidate -Reason 'échéance de sélection dépassée'
             return
@@ -3089,8 +2862,7 @@ function Complete-Wallpaper {
 
         if ($script:Running) { Schedule-NextChange } else { $script:NextChange = $null }
 
-        $menuCurrent.Enabled = $true
-        $CurrentWallpaperButton.IsEnabled = $true
+        Publish-WallpaperState
         Refresh-DiagnosticsUi
     }
     catch {
@@ -3106,6 +2878,11 @@ function Complete-Wallpaper {
         $script:PendingManual = $false
         Start-WallpaperChange -Reason "Manual"
     }
+}
+
+function Publish-WallpaperState {
+    $menuCurrent.Enabled = $true
+    $CurrentWallpaperButton.IsEnabled = $true
 }
 
 function Process-AsyncState {
@@ -3470,41 +3247,26 @@ $notifyIcon.Add_DoubleClick({
     Show-SettingsWindow
 })
 
-$menuExit.Add_Click({
-    $script:Exiting = $true
+$menuExit.Add_Click({ Request-DesktopExit })
 
-    try { $script:Timer.Stop() } catch {}
+$workerVariables=@{}
+foreach($name in @('AppVersion','BaseDir','CacheDir','LogDir','MetadataCachePath','SearchCachePath',
+    'MetadataCacheMaxEntries','MetadataCacheMaxAgeDays','MetadataChecksPerSelection',
+    'SearchRequestsPerSelection','ApiSelectionAttemptsPerMode','ApiBase','HistoryMaxIds',
+    'CacheMaxFiles','CacheMaxBytes','LogRetentionDays','LogMaxBytes')) {
+    $workerVariables[$name]=(Get-Variable -Name $name -ValueOnly)
+}
+$script:SelectionWorker=New-WallhavenSelectionWorker -Functions (Get-WallhavenEngineFunctions) -Variables $workerVariables -PolicyPath $SharedPolicyPath
+# Only UI entry points are rebound; the runspace keeps the canonical engine definition.
+Set-Item Function:Start-WallpaperChange (Get-Item Function:Start-DesktopWallpaperChange).ScriptBlock
 
-    try {
-        $notifyIcon.Visible = $false
-        $notifyIcon.Dispose()
-    } catch {}
-
-    try {
-        if ($script:TrayIconObject) {
-            $script:TrayIconObject.Dispose()
-        }
-    } catch {}
-
-    try { $script:HttpClient.Dispose() } catch {}
-    try { $handler.Dispose() } catch {}
-
-    try {
-        $script:Mutex.ReleaseMutex()
-        $script:Mutex.Dispose()
-    } catch {}
-
-    try { $window.Close() } catch {}
-
-    [System.Windows.Application]::Current.Shutdown()
-})
-
-Load-SearchCache
 $script:Timer = New-Object System.Windows.Threading.DispatcherTimer
 $script:Timer.Interval = [TimeSpan]::FromMilliseconds(300)
 
 $script:Timer.Add_Tick({
-    Process-AsyncState
+    $tickClock=[Diagnostics.Stopwatch]::StartNew()
+    Receive-DesktopSelection
+    if($script:Exiting) { return }
     Process-UpdateState
 
     if (
@@ -3536,6 +3298,7 @@ $script:Timer.Add_Tick({
     }
 
     Update-UiState
+    if($tickClock.ElapsedMilliseconds -ge 50) { Write-Log 'WARN' "ui.tick elapsed_ms=$($tickClock.ElapsedMilliseconds)" }
 })
 
 Sync-UiFromSettings
@@ -3559,7 +3322,7 @@ Write-Log "INFO" (
     [bool]$Autostart,
     $PID,
     $startupMethod,
-    $script:HistoryIds.Count,
+    'chargement worker',
     $HistoryMaxIds,
     $CacheMaxFiles,
     [int]($CacheMaxBytes / 1MB),
@@ -3575,6 +3338,7 @@ if ($script:Running) {
     Start-WallpaperChange -Reason "Startup"
 }
 else {
+    Start-DesktopWallpaperChange -Reason Startup -InitializeOnly
     Set-Status "Rotation en pause."
 }
 

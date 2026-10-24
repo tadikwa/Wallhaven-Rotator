@@ -25,7 +25,8 @@ try {
             'Get-ResolutionQueryParameters','Test-ResolutionFallbackAllowed','Get-DeepErrorMessage',
             'Get-LocalSelectionKey','Start-CachedSelection','Start-WallhavenApiTask',
             'Initialize-SelectionCycle','Write-SelectionSummary','Load-SearchCache','Save-SearchCache',
-            'Start-DiscoveredSelection','Get-QualifiedCandidateRank','Stop-SelectionRequests')) {
+            'Start-DiscoveredSelection','Get-QualifiedCandidateRank','Stop-SelectionRequests',
+            'Get-SelectionHistorySnapshot','Publish-WallpaperState')) {
             Invoke-Expression $fn.Extent.Text
         }
     }
@@ -34,7 +35,8 @@ try {
 using System;
 using System.Collections.Generic;
 using System.Threading.Tasks;
-public class SelectionHttpFixture {
+public class SelectionHttpFixture : IDisposable {
+    public void Dispose() {}
     public List<string> Requests = new List<string>();
     public Queue<string> Replies = new Queue<string>();
     public Dictionary<string,string> UrlReplies = new Dictionary<string,string>();
@@ -118,6 +120,7 @@ public class SelectionHttpFixture {
         $script:SelectionSearches=0; $script:SelectionSeenIds=@{}; $script:SelectionUrls=@{}
         $script:SelectionDeadline=(Get-SharedHistoryNow).AddSeconds(45)
         $script:SelectionSummaryWritten=$false; $script:SelectionStats=$null
+        $script:SelectionHistorySnapshot=$null; $script:WorkerCancellation=$null
         Remove-Item -LiteralPath $script:WallhavenApiBudgetPath -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $MetadataCachePath,$SearchCachePath -Force -ErrorAction SilentlyContinue
     }

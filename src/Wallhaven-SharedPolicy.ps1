@@ -809,12 +809,16 @@ function Normalize-SharedHistoryEntriesUnlocked {
 }
 
 function Get-SharedHistorySnapshot {
+    $clock = [Diagnostics.Stopwatch]::StartNew()
     Invoke-WithSharedHistoryLock {
         $state = Read-SharedHistoryStateUnlocked
-        Invoke-SharedHistoryMigrationUnlocked $state
+        if (-not $state.migrations.rotatorV1 -or -not $state.migrations.screensaverV1) {
+            Invoke-SharedHistoryMigrationUnlocked $state
+            Normalize-SharedHistoryEntriesUnlocked $state
+            Write-SharedHistoryStateUnlocked $state
+        }
+        # Expired leases are ignored on reads; the next mutation prunes them.
         Remove-ExpiredSharedPendingUnlocked $state
-        Normalize-SharedHistoryEntriesUnlocked $state
-        Write-SharedHistoryStateUnlocked $state
 
         $today = (Get-SharedHistoryNow).LocalDateTime.Date
         # Native PowerShell hashtables are case-insensitive by default and expose
@@ -831,7 +835,10 @@ function Get-SharedHistorySnapshot {
             if (-not $id -or -not $shown) { continue }
 
             $historyIds[$id] = $true
-            $lastShown[$id] = $shown
+            if (-not $lastShown.ContainsKey($id) -or $shown -gt $lastShown[$id]) { $lastShown[$id] = $shown }
+        }
+        foreach ($id in $lastShown.Keys) {
+            $shown = $lastShown[$id]
             if ($shown.LocalDateTime.Date -eq $today) {
                 $todayIds[$id] = $true
             }
@@ -850,6 +857,7 @@ function Get-SharedHistorySnapshot {
             SeenTodayCount = $todayIds.Count
             HistoryCount = $historyIds.Count
             PendingCount = $pendingIds.Count
+            ElapsedMs = $clock.Elapsed.TotalMilliseconds
         }
     }
 }
