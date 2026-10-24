@@ -153,7 +153,7 @@ func TestStartMenuManualShortcutWithShortProfilePath(t *testing.T) {
 			oldRunning, oldDelete := isRunning, deleteRunValue
 			t.Cleanup(func() { isRunning, deleteRunValue = oldRunning, oldDelete })
 			isRunning = func() bool { return false }
-			deleteRunValue = func() {}
+			deleteRunValue = func() error { return nil }
 			if err := uninstall(); err != nil {
 				t.Fatal(err)
 			}
@@ -202,8 +202,8 @@ func TestInstallerAndSilentUpdateManageOnlyTheirShortcut(t *testing.T) {
 	isRunning = func() bool { return false }
 	var runCommand, launchMode string
 	setRunValue = func(command string) error { runCommand = command; return nil }
-	deleteRunValue = func() { runCommand = "" }
-	launchInstalledApp = func(_ string, mode string) { launchMode = mode }
+	deleteRunValue = func() error { runCommand = ""; return nil }
+	launchInstalledApp = func(_ string, mode string) error { launchMode = mode; return nil }
 	settings := []byte(`{"sort":"Aléatoire","category":"Toutes","query":"+nature","contentFilter":"Strict","value":7,"unit":"Minutes","autoRotation":false,"resolutionMode":"Personnalisé","resolutionMatch":"Exacte","customWidth":5120,"customHeight":1440,"customRatio":"32:9","checkUpdates":true,"autoUpdate":false,"lastNotifiedUpdate":"","unknown":"keep"}`)
 	if err := os.WriteFile(filepath.Join(dir, "settings.json"), settings, 0644); err != nil {
 		t.Fatal(err)
@@ -391,7 +391,7 @@ func TestStartMenuLockedReplacementAndFailedUninstallPreserveLink(t *testing.T) 
 	oldRunning, oldDelete := isRunning, deleteRunValue
 	t.Cleanup(func() { isRunning, deleteRunValue = oldRunning, oldDelete })
 	isRunning = func() bool { return false }
-	deleteRunValue = func() {}
+	deleteRunValue = func() error { return nil }
 	if err := uninstall(); err == nil {
 		t.Fatal("locked app uninstall succeeded")
 	}
@@ -416,8 +416,8 @@ func TestInstallerForeignShortcutConflictHasNoInstallationSideEffects(t *testing
 	})
 	isRunning = func() bool { return false }
 	setRunValue = func(string) error { t.Fatal("registry written before shortcut preflight"); return nil }
-	deleteRunValue = func() { t.Fatal("registry deleted before shortcut preflight") }
-	launchInstalledApp = func(string, string) { t.Fatal("app launched on shortcut conflict") }
+	deleteRunValue = func() error { t.Fatal("registry deleted before shortcut preflight"); return nil }
+	launchInstalledApp = func(string, string) error { t.Fatal("app launched on shortcut conflict"); return nil }
 	if err := installWithLaunch("show", true); err == nil {
 		t.Fatal("foreign conflict was not reported")
 	}
@@ -426,7 +426,7 @@ func TestInstallerForeignShortcutConflictHasNoInstallationSideEffects(t *testing
 		t.Fatal("payload overwritten before conflict was reported")
 	}
 	// A successful uninstall must also leave this same-name foreign shortcut alone.
-	deleteRunValue = func() {}
+	deleteRunValue = func() error { return nil }
 	if err := uninstall(); err != nil {
 		t.Fatal(err)
 	}

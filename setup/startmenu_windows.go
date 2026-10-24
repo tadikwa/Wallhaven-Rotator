@@ -266,7 +266,7 @@ func ensureStartMenuShortcut(dir string) error {
 	}
 	defer os.Remove(name)
 	info := shellLinkInfo{Target: windowsScriptHost(), Arguments: fmt.Sprintf(`//B //Nologo "%s" show`, filepath.Join(dir, "Wallhaven-Rotator-Launcher.vbs")), Icon: filepath.Join(dir, "Wallhaven-Rotator.ico"), Work: dir, Description: appName}
-	if err = writeShellLink(name, info); err != nil {
+	if err = setupPhase("shortcut.com.save", func() error { return writeShellLink(name, info) }); err != nil {
 		return err
 	}
 	// Recheck ownership before publishing; a failed replacement never deletes the old link.
@@ -276,8 +276,10 @@ func ensureStartMenuShortcut(dir string) error {
 	if err = os.Rename(name, path); err != nil {
 		return err
 	}
-	procSHChangeNotify.Call(0x2000, 5, uintptr(unsafe.Pointer(utf16Ptr(path))), 0)
-	return nil
+	return setupPhase("shortcut.shell.notify", func() error {
+		procSHChangeNotify.Call(0x2000, 5, uintptr(unsafe.Pointer(utf16Ptr(path))), 0)
+		return nil
+	})
 }
 
 var procSHChangeNotify = shell32.NewProc("SHChangeNotify")

@@ -96,4 +96,5 @@ jobs:
             dist/WallhavenRotator-Setup-v*.exe
             dist/WallhavenRotator-Setup-v*-SHA256.txt
             dist/network-budget-results.json
+            dist/setup-ui-metrics.json
           if-no-files-found: error
