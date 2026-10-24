@@ -6,7 +6,7 @@
 # Version épurée : rotation du wallpaper Wallhaven uniquement.
 
 $ErrorActionPreference = "Stop"
-$script:AppVersion = "1.2.0"
+$script:AppVersion = "1.2.1"
 
 Add-Type -AssemblyName PresentationFramework
 Add-Type -AssemblyName PresentationCore
